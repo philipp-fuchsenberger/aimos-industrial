@@ -1,0 +1,1155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIMOS Control Center</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-base: #0a1118;
+    --bg-card: #1a2332;
+    --border: rgba(255,255,255,0.05);
+    --blue: #0070f3;
+    --green: #10b981;
+    --red: #ef4444;
+    --amber: #f59e0b;
+    --purple: #a855f7;
+    --text: #e2e8f0;
+    --text-dim: #64748b;
+    --text-muted: #475569;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg-base);
+    color: var(--text);
+    font-family: 'Inter', -apple-system, sans-serif;
+    font-size: 14px;
+    padding: 24px 32px;
+    min-height: 100vh;
+  }
+
+  /* ── Header ──────────────────────────────────────────────────────────── */
+  .header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 24px;
+    flex-wrap: wrap;
+  }
+  .header h1 {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--text);
+    letter-spacing: -0.02em;
+  }
+  .header h1 span { color: var(--blue); }
+  .version-badge {
+    background: rgba(0,112,243,0.12);
+    color: var(--blue);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 4px;
+    border: 1px solid rgba(0,112,243,0.2);
+  }
+  .clock {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .header-spacer { flex: 1; }
+  .header-controls {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+  }
+
+  /* ── Toggle Switch ───────────────────────────────────────────────────── */
+  .toggle-group {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .toggle-label {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-dim);
+  }
+  .toggle-switch {
+    position: relative;
+    width: 44px;
+    height: 24px;
+    cursor: pointer;
+  }
+  .toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+  }
+  .toggle-slider {
+    position: absolute;
+    inset: 0;
+    background: #334155;
+    border-radius: 12px;
+    transition: background 0.25s;
+  }
+  .toggle-slider::before {
+    content: '';
+    position: absolute;
+    width: 18px;
+    height: 18px;
+    left: 3px;
+    top: 3px;
+    background: #fff;
+    border-radius: 50%;
+    transition: transform 0.25s;
+  }
+  .toggle-switch input:checked + .toggle-slider {
+    background: var(--green);
+  }
+  .toggle-switch input:checked + .toggle-slider::before {
+    transform: translateX(20px);
+  }
+  .toggle-status {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    min-width: 28px;
+  }
+  .toggle-status.on { color: var(--green); }
+  .toggle-status.off { color: var(--text-dim); }
+
+  /* ── Buttons ─────────────────────────────────────────────────────────── */
+  button {
+    cursor: pointer;
+    border: none;
+    border-radius: 6px;
+    padding: 7px 16px;
+    font-family: 'Inter', sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    transition: all 0.15s;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:active { transform: scale(0.98); }
+  .btn-blue { background: var(--blue); color: #fff; }
+  .btn-green { background: var(--green); color: #fff; }
+  .btn-red { background: var(--red); color: #fff; }
+  .btn-ghost {
+    background: transparent;
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    padding: 6px 14px;
+  }
+  .btn-ghost:hover { background: rgba(255,255,255,0.04); color: var(--text); }
+  .btn-shutdown {
+    background: rgba(239,68,68,0.12);
+    color: var(--red);
+    border: 1px solid rgba(239,68,68,0.2);
+    font-size: 11px;
+    padding: 6px 14px;
+  }
+  .btn-shutdown:hover { background: rgba(239,68,68,0.25); }
+
+  /* ── Alert Banner ────────────────────────────────────────────────────── */
+  .alert-banner {
+    display: none;
+    background: rgba(239,68,68,0.12);
+    border: 1px solid rgba(239,68,68,0.3);
+    color: var(--red);
+    padding: 10px 16px;
+    border-radius: 8px;
+    margin-bottom: 16px;
+    font-size: 13px;
+    font-weight: 500;
+    align-items: center;
+    gap: 12px;
+  }
+  .alert-banner button {
+    background: var(--red);
+    color: #fff;
+    font-size: 11px;
+    padding: 3px 10px;
+    margin-left: 12px;
+  }
+
+  /* ── Cards ───────────────────────────────────────────────────────────── */
+  .grid-3 {
+    display: grid;
+    grid-template-columns: 3fr 3fr 1fr;
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+  }
+  .card-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 16px;
+  }
+  .card-title span { color: var(--text); font-weight: 700; }
+
+  /* ── Progress Bars ───────────────────────────────────────────────────── */
+  .progress-row {
+    margin-bottom: 12px;
+  }
+  .progress-row:last-child { margin-bottom: 0; }
+  .progress-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+  }
+  .progress-label {
+    font-size: 12px;
+    color: var(--text-dim);
+    font-weight: 500;
+  }
+  .progress-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--text);
+    font-weight: 500;
+  }
+  .progress-track {
+    width: 100%;
+    height: 8px;
+    background: rgba(255,255,255,0.06);
+    border-radius: 4px;
+    overflow: hidden;
+    position: relative;
+  }
+  .progress-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.5s ease;
+    min-width: 2px;
+  }
+  .progress-fill.blue { background: var(--blue); }
+  .progress-fill.green { background: var(--green); }
+  .progress-fill.amber { background: var(--amber); }
+  .progress-fill.red { background: var(--red); }
+  .progress-fill.purple { background: var(--purple); }
+
+  /* VRAM bar */
+  .vram-title {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+    display: flex;
+    justify-content: space-between;
+  }
+  .vram-title strong { color: var(--text); }
+  .vram-bar-container {
+    margin-bottom: 12px;
+  }
+  .vram-track {
+    width: 100%;
+    height: 32px;
+    background: rgba(255,255,255,0.06);
+    border-radius: 6px;
+    overflow: hidden;
+    display: flex;
+  }
+  .vram-segment {
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    font-weight: 600;
+    overflow: hidden;
+    white-space: nowrap;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.6);
+    transition: width 0.5s ease;
+  }
+  .gpu-stats {
+    display: flex;
+    gap: 24px;
+    margin-top: 4px;
+  }
+  .gpu-stat {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .gpu-stat strong {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  /* ── Agents Section ──────────────────────────────────────────────────── */
+  .section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+  .section-title {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--text);
+  }
+  .show-inactive-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-dim);
+    cursor: pointer;
+    user-select: none;
+  }
+  .show-inactive-toggle input {
+    accent-color: var(--blue);
+    cursor: pointer;
+  }
+
+  .agent-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    transition: all 0.2s;
+  }
+  .agent-card.status-active,
+  .agent-card.status-running,
+  .agent-card.status-idle {
+    border-left: 3px solid var(--green);
+  }
+  .agent-card.status-starting {
+    border-left: 3px solid var(--blue);
+  }
+  .agent-card.status-dreaming {
+    border-left: 3px solid var(--purple);
+  }
+  .agent-card.inactive-card {
+    opacity: 0.55;
+  }
+  .agent-info {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .agent-checkbox {
+    width: 15px;
+    height: 15px;
+    accent-color: var(--green);
+    cursor: pointer;
+  }
+  .agent-display-name {
+    font-weight: 600;
+    font-size: 14px;
+  }
+  .agent-internal-name {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  /* ── Badges ──────────────────────────────────────────────────────────── */
+  .badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .badge-active, .badge-running, .badge-idle {
+    background: rgba(16,185,129,0.15);
+    color: var(--green);
+  }
+  .badge-offline {
+    background: rgba(239,68,68,0.1);
+    color: var(--red);
+  }
+  .badge-starting {
+    background: rgba(0,112,243,0.15);
+    color: var(--blue);
+  }
+  .badge-dreaming {
+    background: rgba(168,85,247,0.15);
+    color: var(--purple);
+  }
+
+  .agent-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .agent-actions button {
+    padding: 5px 14px;
+    font-size: 11px;
+  }
+
+  /* ── Log Viewer ──────────────────────────────────────────────────────── */
+  .log-section { margin-top: 24px; }
+  .log-tabs {
+    display: flex;
+    gap: 2px;
+    margin-bottom: 0;
+    flex-wrap: wrap;
+  }
+  .log-tab {
+    padding: 8px 16px;
+    border-radius: 6px 6px 0 0;
+    cursor: pointer;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    font-weight: 500;
+    background: rgba(255,255,255,0.03);
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    border-bottom: none;
+    transition: all 0.15s;
+    user-select: none;
+  }
+  .log-tab:hover { background: rgba(255,255,255,0.06); color: var(--text); }
+  .log-tab.active {
+    background: var(--bg-card);
+    color: var(--blue);
+    border-color: var(--border);
+  }
+  .log-box {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 0 8px 8px 8px;
+    padding: 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    line-height: 1.6;
+    max-height: 340px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    color: var(--text-dim);
+  }
+  .log-box::-webkit-scrollbar { width: 6px; }
+  .log-box::-webkit-scrollbar-track { background: transparent; }
+  .log-box::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
+
+  /* ── Bottom ──────────────────────────────────────────────────────────── */
+  .bottom-bar {
+    margin-top: 20px;
+    display: flex;
+    gap: 10px;
+  }
+
+  /* ── Result toast ────────────────────────────────────────────────────── */
+  #result {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--green);
+    margin-top: 8px;
+    min-height: 18px;
+  }
+
+  /* ── Responsive ──────────────────────────────────────────────────────── */
+  @media (max-width: 768px) {
+    body { padding: 16px; }
+    .grid-3 { grid-template-columns: 1fr; }
+    .grid-2 { grid-template-columns: 1fr; }
+    .header { gap: 10px; }
+    .header-controls { flex-wrap: wrap; gap: 12px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Alert Banner -->
+<div class="alert-banner" id="alert-banner"></div>
+<div id="ollama-banner" style="display:none;background:var(--amber);color:#000;padding:8px 16px;border-radius:6px;margin-bottom:12px;font-size:12px;font-weight:600;font-family:Inter,sans-serif;"></div>
+
+<!-- Header -->
+<div class="header">
+  <h1>AIMOS <span>Control Center</span></h1>
+  <span class="version-badge">v4.5.0</span>
+  <span class="clock" id="clock">{{ now }}</span>
+  <div class="header-spacer"></div>
+  <div class="header-controls">
+    <div class="toggle-group">
+      <span class="toggle-label">Orchestrator</span>
+      <label class="toggle-switch">
+        <input type="checkbox" id="orch-toggle" {{ 'checked' if orchestrator_on else '' }} onchange="toggleOrch(this.checked)">
+        <span class="toggle-slider"></span>
+      </label>
+      <span class="toggle-status {{ 'on' if orchestrator_on else 'off' }}" id="orch-label">{{ 'ON' if orchestrator_on else 'OFF' }}</span>
+    </div>
+  </div>
+</div>
+
+<!-- GPU + System Cards -->
+<div class="grid-3">
+  <div class="card">
+    <div class="card-title">GPU — <span id="gpu-name">RTX 3090</span></div>
+    <div id="gpu-panel">
+      {% if metrics.gpu %}
+      <div class="vram-title">
+        <span>VRAM</span>
+        <strong id="vram">{{ metrics.gpu.vram_used_mb }} / {{ metrics.gpu.vram_total_mb }} MB</strong>
+      </div>
+      <div class="vram-bar-container">
+        <div class="vram-track">
+          <div class="vram-segment" id="vram-weights" style="width:0%; background:var(--purple); color:#fff;"></div>
+          <div class="vram-segment" id="vram-kv" style="width:0%; background:var(--blue); color:#fff;"></div>
+        </div>
+      </div>
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-top:6px;">
+        <div style="display:flex; gap:14px; font-size:10px; font-family:'JetBrains Mono',monospace;">
+          <span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:var(--purple);margin-right:4px;vertical-align:middle;"></span><span style="color:var(--text-dim)">LLM Model</span></span>
+          <span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:var(--blue);margin-right:4px;vertical-align:middle;"></span><span style="color:var(--text-dim)">Context Memory</span></span>
+          <span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:rgba(255,255,255,0.06);margin-right:4px;vertical-align:middle;border:1px solid rgba(255,255,255,0.1);"></span><span style="color:var(--text-dim)">Free</span></span>
+        </div>
+        <div class="gpu-stats">
+          <span class="gpu-stat">Load <strong id="gpu-load">{{ metrics.gpu.gpu_util_percent }}%</strong></span>
+          <span class="gpu-stat">Temp <strong id="gpu-temp">{{ metrics.gpu.temp_c }}°C</strong></span>
+        </div>
+      </div>
+      {% else %}
+      <div style="color: var(--text-dim); font-size: 13px;">nvidia-smi unavailable</div>
+      {% endif %}
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">System</div>
+    <div class="progress-row">
+      <div class="progress-header">
+        <span class="progress-label">CPU</span>
+        <span class="progress-value" id="cpu">{{ metrics.cpu_percent }}%</span>
+      </div>
+      <div class="progress-track">
+        <div class="progress-fill blue" id="cpu-bar" style="width: {{ metrics.cpu_percent }}%;"></div>
+      </div>
+    </div>
+    <div class="progress-row">
+      <div class="progress-header">
+        <span class="progress-label">RAM</span>
+        <span class="progress-value" id="ram">{{ metrics.ram_used_gb }} / {{ metrics.ram_total_gb }} GB</span>
+      </div>
+      <div class="progress-track">
+        <div class="progress-fill green" id="ram-bar" style="width: {{ (metrics.ram_used_gb / metrics.ram_total_gb * 100) | round(1) if metrics.ram_total_gb else 0 }}%;"></div>
+      </div>
+    </div>
+    <div class="progress-row">
+      <div class="progress-header">
+        <span class="progress-label">Disk</span>
+        <span class="progress-value" id="disk">{{ metrics.disk_percent }}%</span>
+      </div>
+      <div class="progress-track">
+        <div class="progress-fill {% if metrics.disk_percent > 85 %}red{% elif metrics.disk_percent > 70 %}amber{% else %}blue{% endif %}" id="disk-bar" style="width: {{ metrics.disk_percent }}%;"></div>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title" style="display:flex; justify-content:space-between; align-items:center;">
+      Backup
+      <a href="/backup-settings" style="color:var(--text-dim); font-size:14px; text-decoration:none;" title="Backup Settings">&#9881;</a>
+    </div>
+    <div style="font-family:'JetBrains Mono',monospace; font-size:12px;">
+      <div id="backup-status" style="color:var(--text-dim); margin-bottom:10px;">Checking...</div>
+      <button class="btn-blue" id="backup-btn" onclick="runBackup()" style="width:100%; padding:8px; font-size:12px;">Run Backup Now</button>
+    </div>
+  </div>
+</div>
+
+<!-- Agents Section -->
+<div class="section-header">
+  <span class="section-title">Agent Team</span>
+  <label class="show-inactive-toggle">
+    <input type="checkbox" id="show-inactive" autocomplete="off" onchange="toggleInactiveVisibility()">
+    Show inactive
+  </label>
+</div>
+
+<div id="agents-container">
+{% set active_agents = [] %}
+{% set inactive_agents = [] %}
+{% for a in agents %}
+  {% if a.config.get('active', True) is sameas false %}
+    {% set _ = inactive_agents.append(a) %}
+  {% else %}
+    {% set _ = active_agents.append(a) %}
+  {% endif %}
+{% endfor %}
+
+{% for a in active_agents %}
+{% set agent_cfg = a.config if a.config is mapping else {} %}
+<div class="agent-card status-{{ a.status or 'offline' }}" id="agent-{{ a.name }}" data-team="active">
+  <div class="agent-info">
+    <input type="checkbox" class="agent-checkbox" id="cb-{{ a.name }}" autocomplete="off" title="Active team member" checked
+           onchange="toggleAgentActive('{{ a.name }}', this.checked)">
+    <span class="agent-display-name">{{ agent_cfg.get('display_name', a.name) }}</span>
+    <span class="agent-internal-name">{{ a.name }}</span>
+    <span class="badge badge-{{ a.status or 'offline' }}" id="badge-{{ a.name }}">{{ a.status or 'offline' }}</span>
+  </div>
+  <div class="agent-actions" id="btns-{{ a.name }}">
+    {% if a.status in ('active', 'running', 'idle') %}
+    <button class="btn-red" onclick="doStop('{{ a.name }}')">Stop</button>
+    {% else %}
+    <button class="btn-green" onclick="doStart('{{ a.name }}')">Start</button>
+    {% endif %}
+    <button class="btn-ghost" onclick="location.href='/wizard/{{ a.name }}'">Edit</button>
+  </div>
+</div>
+{% endfor %}
+
+{% for a in inactive_agents %}
+{% set agent_cfg = a.config if a.config is mapping else {} %}
+<div class="agent-card inactive-card status-{{ a.status or 'offline' }}" id="agent-{{ a.name }}" data-team="inactive" style="display:none;">
+  <div class="agent-info">
+    <input type="checkbox" class="agent-checkbox" id="cb-{{ a.name }}" autocomplete="off" title="Active team member"
+           onchange="toggleAgentActive('{{ a.name }}', this.checked)">
+    <span class="agent-display-name">{{ agent_cfg.get('display_name', a.name) }}</span>
+    <span class="agent-internal-name">{{ a.name }}</span>
+    <span class="badge badge-{{ a.status or 'offline' }}" id="badge-{{ a.name }}">{{ a.status or 'offline' }}</span>
+  </div>
+  <div class="agent-actions" id="btns-{{ a.name }}">
+    <button class="btn-green" onclick="doStart('{{ a.name }}')">Start</button>
+    <button class="btn-ghost" onclick="location.href='/wizard/{{ a.name }}'">Edit</button>
+  </div>
+</div>
+{% endfor %}
+
+{% if not active_agents and not inactive_agents %}
+<div style="color: var(--text-dim); font-size: 13px; padding: 16px;">No agents configured yet.</div>
+{% endif %}
+</div>
+
+<!-- Log Viewer -->
+<div class="log-section">
+  <div class="log-tabs" id="log-tabs">
+    {% for a in agents %}
+    <div class="log-tab {% if loop.first %}active{% endif %}" data-agent="{{ a.name }}" onclick="switchLog(this)">{{ a.name }}</div>
+    {% endfor %}
+    <div class="log-tab" data-agent="orchestrator" onclick="switchLog(this)">orchestrator</div>
+  </div>
+  <div class="log-box" id="logbox">Loading logs...</div>
+</div>
+
+<!-- Chat -->
+<div class="log-section">
+  <div style="font-family:Inter,sans-serif; font-size:14px; font-weight:600; color:var(--blue); margin-bottom:10px;">Agent Chat</div>
+  <div style="display:flex; gap:8px; margin-bottom:10px;">
+    <select id="chat-agent" style="background:var(--card-bg); border:1px solid var(--card-border); color:var(--text); padding:8px 14px; border-radius:6px; font-family:'JetBrains Mono',monospace; font-size:13px; font-weight:600; min-width:160px;">
+      {% for a in active_agents %}<option value="{{ a.name }}">{{ (a.config if a.config is mapping else {}).get('display_name', a.name) }}</option>{% endfor %}
+    </select>
+    <input type="text" id="chat-input" placeholder="Type a message..."
+           onkeydown="if(event.key==='Enter')sendChat()"
+           style="flex:1; background:var(--card-bg); border:1px solid var(--card-border); color:var(--text); padding:8px 14px; border-radius:6px; font-family:'JetBrains Mono',monospace; font-size:13px; outline:none;">
+    <button class="btn-blue chat-send-btn" onclick="sendChat()" style="padding:8px 24px; font-size:13px;">Send</button>
+    <button class="btn-red chat-cancel-btn" onclick="cancelChat()" style="padding:8px 16px; font-size:13px; display:none;">Cancel</button>
+  </div>
+  <div id="chat-messages" style="background:var(--card-bg); border:1px solid var(--card-border); border-radius:6px; padding:14px; min-height:120px; max-height:400px; overflow-y:auto; font-size:13px; font-family:'JetBrains Mono',monospace; line-height:1.6;">
+    <span style="color:var(--text-dim);">Select an agent and send a message.</span>
+  </div>
+</div>
+
+<!-- Bottom -->
+<div class="bottom-bar">
+  <button class="btn-blue" onclick="location.href='/wizard'">+ New Agent</button>
+</div>
+<div id="result"></div>
+
+<script>
+let currentLogAgent = '{{ agents[0].name if agents else "neo" }}';
+
+// ── Show/Hide Inactive Agents ─────────────────────────────────────────────
+function toggleInactiveVisibility() {
+  const show = document.getElementById('show-inactive').checked;
+  localStorage.setItem('aimos_show_inactive', show ? '1' : '0');
+  document.querySelectorAll('[data-team="inactive"]').forEach(el => {
+    el.style.display = show ? 'flex' : 'none';
+  });
+}
+// Restore show-inactive state on page load
+(function() {
+  const saved = localStorage.getItem('aimos_show_inactive');
+  if (saved === '1') {
+    const cb = document.getElementById('show-inactive');
+    if (cb) { cb.checked = true; toggleInactiveVisibility(); }
+  }
+})();
+
+// ── VRAM Model Detection ──────────────────────────────────────────────────
+// Auto-detect model from Ollama API
+let _cachedModelName = 'LLM';
+let _cachedModelWeight = 9000;
+async function _detectOllamaModel() {
+  try {
+    const r = await fetch('/api/metrics');
+    const m = await r.json();
+    if (m.ollama && m.ollama.model) {
+      _cachedModelName = m.ollama.model;
+      _cachedModelWeight = m.ollama.vram_mb || 9000;
+    }
+  } catch(e) {}
+}
+_detectOllamaModel(); setInterval(_detectOllamaModel, 30000);
+
+function getVramModel(usedMb) {
+  if (usedMb > 3000) {
+    const kvCache = Math.max(0, usedMb - _cachedModelWeight);
+    return { name: _cachedModelName, color: 'var(--purple)', weights: _cachedModelWeight, kv: kvCache };
+  }
+  return { name: 'Empty', color: 'var(--text-dim)', weights: 0, kv: 0 };
+}
+
+function getBarColor(pct) {
+  if (pct > 90) return 'var(--red)';
+  if (pct > 70) return 'var(--amber)';
+  return 'var(--blue)';
+}
+
+// ── Live Refresh (3s interval) ────────────────────────────────────────────
+async function refreshAll() {
+  try {
+    const [agentsResp, metricsResp, orchResp, alertsResp] = await Promise.all([
+      fetch('/api/agents'),
+      fetch('/api/metrics'),
+      fetch('/api/orchestrator/status'),
+      fetch('/api/alerts'),
+    ]);
+    const agents = await agentsResp.json();
+    const metrics = await metricsResp.json();
+    const orch = await orchResp.json();
+    const alerts = await alertsResp.json();
+
+    // Alert banner
+    const alertBox = document.getElementById('alert-banner');
+    if (alertBox) {
+      if (alerts.length > 0) {
+        const a = alerts[0];
+        const msg = a.data?.error || JSON.stringify(a.data);
+        const agent = a.data?.agent || '?';
+        alertBox.innerHTML = '<strong>Warning</strong>: ' + msg + ' (agent: ' + agent + ', ' + (a.time?.slice(0,19) || '?') + ') <button onclick="fetch(\'/api/alerts/' + a.type + '\',{method:\'DELETE\'}).then(()=>this.parentElement.style.display=\'none\')">Dismiss</button>';
+        alertBox.style.display = 'flex';
+      } else {
+        alertBox.style.display = 'none';
+      }
+    }
+
+    // Update agent cards
+    for (const a of agents) {
+      const card = document.getElementById('agent-' + a.name);
+      if (!card) continue;
+      const status = a.status || 'offline';
+      const isActive = ['active','running','idle','starting','dreaming'].includes(status);
+
+      // Card border styling
+      card.className = 'agent-card status-' + status;
+      if (card.dataset.team === 'inactive') card.classList.add('inactive-card');
+
+      // Badge
+      const badge = document.getElementById('badge-' + a.name);
+      if (badge) { badge.textContent = status; badge.className = 'badge badge-' + status; }
+
+      // Buttons
+      const btns = document.getElementById('btns-' + a.name);
+      if (btns) {
+        if (['active','running','idle'].includes(status)) {
+          btns.innerHTML = '<button class="btn-red" onclick="doStop(\'' + a.name + '\')">Stop</button>' +
+            '<button class="btn-ghost" onclick="location.href=\'/wizard/' + a.name + '\'">Edit</button>';
+        } else {
+          btns.innerHTML = '<button class="btn-green" onclick="doStart(\'' + a.name + '\')">Start</button>' +
+            '<button class="btn-ghost" onclick="location.href=\'/wizard/' + a.name + '\'">Edit</button>';
+        }
+      }
+    }
+
+    // Update GPU metrics
+    if (metrics.gpu) {
+      const vramUsed = metrics.gpu.vram_used_mb;
+      const vramTotal = metrics.gpu.vram_total_mb;
+      const vramPct = vramTotal > 0 ? (vramUsed / vramTotal * 100) : 0;
+
+      const vramWeightsBar = document.getElementById('vram-weights');
+      const vramKvBar = document.getElementById('vram-kv');
+      const vramText = document.getElementById('vram');
+      const gpuLoad = document.getElementById('gpu-load');
+      const gpuTemp = document.getElementById('gpu-temp');
+
+      if (vramText) vramText.textContent = vramUsed + ' / ' + vramTotal + ' MB';
+      const model = getVramModel(vramUsed);
+      if (vramWeightsBar && vramTotal > 0) {
+        const wPct = (model.weights / vramTotal * 100);
+        const kPct = (model.kv / vramTotal * 100);
+        vramWeightsBar.style.width = wPct.toFixed(1) + '%';
+        vramWeightsBar.textContent = model.name ? model.name + ' (' + (model.weights/1000).toFixed(0) + ' GB)' : '';
+        vramKvBar.style.width = kPct.toFixed(1) + '%';
+        vramKvBar.textContent = model.kv > 500 ? 'Context (' + (model.kv/1000).toFixed(1) + ' GB)' : '';
+      }
+      if (gpuLoad) gpuLoad.textContent = metrics.gpu.gpu_util_percent + '%';
+      if (gpuTemp) gpuTemp.textContent = metrics.gpu.temp_c + '°C';
+    }
+
+    // Update system metrics
+    const cpu = document.getElementById('cpu');
+    const ram = document.getElementById('ram');
+    const disk = document.getElementById('disk');
+    const cpuBar = document.getElementById('cpu-bar');
+    const ramBar = document.getElementById('ram-bar');
+    const diskBar = document.getElementById('disk-bar');
+
+    if (cpu) cpu.textContent = metrics.cpu_percent + '%';
+    if (cpuBar) cpuBar.style.width = metrics.cpu_percent + '%';
+    if (ram) ram.textContent = metrics.ram_used_gb + ' / ' + metrics.ram_total_gb + ' GB';
+    if (ramBar && metrics.ram_total_gb > 0) ramBar.style.width = (metrics.ram_used_gb / metrics.ram_total_gb * 100).toFixed(1) + '%';
+    if (disk) disk.textContent = metrics.disk_percent + '%';
+    if (diskBar) diskBar.style.width = metrics.disk_percent + '%';
+
+    // Update orchestrator toggle
+    const orchToggle = document.getElementById('orch-toggle');
+    const orchLabel = document.getElementById('orch-label');
+    if (orchToggle) orchToggle.checked = orch.orchestrator_enabled;
+    if (orchLabel) {
+      orchLabel.textContent = orch.orchestrator_enabled ? 'ON' : 'OFF';
+      orchLabel.className = 'toggle-status ' + (orch.orchestrator_enabled ? 'on' : 'off');
+    }
+
+    // Update clock
+    document.getElementById('clock').textContent = new Date().toISOString().replace('T',' ').slice(0,19) + ' UTC';
+
+    // Ollama health check
+    try {
+      const ollamaResp = await fetch('/api/ollama/health', {credentials: 'include'});
+      const ollamaData = await ollamaResp.json();
+      const ollamaBanner = document.getElementById('ollama-banner');
+      if (ollamaBanner) {
+        if (!ollamaData.ok) {
+          ollamaBanner.textContent = '⚠ LLM Engine Offline — Ollama is not responding. Agents cannot process messages.';
+          ollamaBanner.style.display = 'block';
+        } else {
+          ollamaBanner.style.display = 'none';
+        }
+      }
+    } catch(e) {}
+
+  } catch(e) { /* silent fail on network hiccup */ }
+}
+
+setInterval(refreshAll, 5000);
+
+// ── Log Refresh ───────────────────────────────────────────────────────────
+function switchLog(el) {
+  document.querySelectorAll('.log-tab').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  currentLogAgent = el.dataset.agent;
+  refreshLogs();
+}
+
+async function refreshLogs() {
+  try {
+    const r = await fetch('/api/logs/' + currentLogAgent + '?lines=40');
+    const d = await r.json();
+    const box = document.getElementById('logbox');
+    box.innerHTML = d.lines.map(l => {
+      const escaped = l.replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      if (/\bERROR\b/.test(l)) return '<span style="color:var(--red)">' + escaped + '</span>';
+      if (/\bWARNING\b/.test(l)) return '<span style="color:var(--amber)">' + escaped + '</span>';
+      return escaped;
+    }).join('<br>') || '<span style="color:var(--text-dim)">No logs yet</span>';
+    box.scrollTop = box.scrollHeight;
+  } catch(e) {}
+}
+refreshLogs();
+setInterval(refreshLogs, 5000);
+
+// ── Actions ───────────────────────────────────────────────────────────────
+async function toggleOrch(enabled) {
+  const r = await fetch('/api/orchestrator', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})});
+  document.getElementById('result').textContent = enabled ? 'Orchestrator ON' : 'Orchestrator OFF';
+}
+
+async function doStart(name) {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = 'Starting...';
+  await fetch('/api/agents/'+name+'/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+  // Optimistically update badge
+  const badge = document.getElementById('badge-' + name);
+  if (badge) { badge.textContent = 'starting'; badge.className = 'badge badge-starting'; }
+  document.getElementById('result').textContent = 'Start requested: ' + name;
+  setTimeout(() => { btn.disabled = false; btn.textContent = 'Stop'; }, 3000);
+}
+
+async function doStop(name) {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = 'Stopping...';
+  await fetch('/api/agents/'+name+'/stop', {method:'POST'});
+  // Optimistically update badge
+  const badge = document.getElementById('badge-' + name);
+  if (badge) { badge.textContent = 'offline'; badge.className = 'badge badge-offline'; }
+  document.getElementById('result').textContent = 'Stop requested: ' + name;
+  setTimeout(() => { btn.disabled = false; btn.textContent = 'Start'; }, 3000);
+}
+
+async function toggleAgentActive(name, active) {
+  const resp = await fetch('/api/agents/'+name+'/active', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({active: active})
+  });
+  const r = await resp.json();
+  // Immediately hide/move the card visually while waiting for reload
+  const card = document.getElementById('agent-' + name);
+  if (card) card.style.opacity = '0.3';
+  document.getElementById('result').textContent = name + ': ' + (active ? 'added to team' : 'removed from team');
+  // Hard reload after DB has settled
+  location.reload();
+}
+
+async function masterShutdown() {
+  if (!confirm('Shutdown all agents and flush VRAM?')) return;
+  await fetch('/api/system/shutdown', {method:'POST'});
+  document.getElementById('result').textContent = 'Shutdown complete.';
+}
+// ── Dashboard Chat ───────────────────────────────────────────────────────
+const chatMessages = JSON.parse(sessionStorage.getItem('aimos_chat') || '[]');
+let chatBusy = false;
+let chatCancelled = false;
+
+function escapeHtml(t) {
+  return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
+}
+
+function cancelChat() {
+  chatCancelled = true;
+}
+
+// Restore chat history on page load
+(function() {
+  const savedAgent = sessionStorage.getItem('aimos_chat_agent');
+  if (savedAgent) {
+    const sel = document.getElementById('chat-agent');
+    if (sel) { for (const opt of sel.options) { if (opt.value === savedAgent) { sel.value = savedAgent; break; } } }
+  }
+  renderChat();
+})();
+
+async function sendChat() {
+  const input = document.getElementById('chat-input');
+  const sendBtn = document.querySelector('#chat-input + button, .chat-send-btn');
+  const agentSelect = document.getElementById('chat-agent');
+  const agent = agentSelect.value;
+  sessionStorage.setItem('aimos_chat_agent', agent);
+  const text = input.value.trim();
+  if (!text || chatBusy) return;
+
+  // Lock UI
+  chatBusy = true;
+  input.disabled = true;
+  agentSelect.disabled = true;
+  if (sendBtn) { sendBtn.disabled = true; sendBtn.textContent = '...'; }
+
+  input.value = '';
+  addChatMessage('you', text);
+
+  // Check if agent is running — if orchestrator is AUTO, queue anyway (it will start the agent)
+  try {
+    const [statusResp, orchResp] = await Promise.all([
+      fetch('/api/agents', {credentials: 'include'}),
+      fetch('/api/orchestrator/status', {credentials: 'include'}),
+    ]);
+    const agents = await statusResp.json();
+    const orch = await orchResp.json();
+    const agentInfo = agents.find(a => a.name === agent);
+    const isRunning = agentInfo && ['active','running','idle','starting'].includes(agentInfo.status);
+    const isAuto = orch.orchestrator_enabled;
+    if (!isRunning && !isAuto) {
+      addChatMessage('system', 'Agent "' + agent + '" is offline and orchestrator is on manual. Start the agent first.');
+      unlockChat(input, agentSelect, sendBtn);
+      return;
+    }
+    if (!isRunning && isAuto) {
+      addChatMessage('system', 'Agent "' + agent + '" will be started automatically...');
+    }
+  } catch(e) {
+    // Can't verify — proceed anyway, let the backend handle it
+  }
+
+  // Send to REST API
+  try {
+    const resp = await fetch('/api/v1/agents/' + agent + '/ask', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      credentials: 'include',
+      body: JSON.stringify({text: text})
+    });
+    const r = await resp.json();
+    if (r.msg_id) {
+      addChatMessage('system', 'Waiting for ' + agent + '...');
+      document.querySelector('.chat-cancel-btn').style.display = '';
+      await pollForResponse(agent, r.msg_id);
+    } else {
+      addChatMessage('system', 'Error: ' + (r.detail || r.error || JSON.stringify(r)));
+    }
+  } catch(e) {
+    addChatMessage('system', 'Error: ' + e.message);
+  }
+
+  unlockChat(input, agentSelect, sendBtn);
+}
+
+function unlockChat(input, agentSelect, sendBtn) {
+  chatBusy = false;
+  input.disabled = false;
+  agentSelect.disabled = false;
+  if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = 'Send'; }
+  document.querySelector('.chat-cancel-btn').style.display = 'none';
+  chatCancelled = false;
+  input.focus();
+}
+
+async function pollForResponse(agent, msgId) {
+  for (let i = 0; i < 90; i++) {
+    await new Promise(r => setTimeout(r, 1000));
+    if (chatCancelled) {
+      const msgs = document.getElementById('chat-messages');
+      const waiting = msgs.querySelector('.chat-waiting');
+      if (waiting) waiting.remove();
+      addChatMessage('system', 'Cancelled.');
+      return;
+    }
+    try {
+      const resp = await fetch('/api/v1/agents/' + agent + '/response/' + msgId, {credentials: 'include'});
+      if (!resp.ok) continue;
+      const r = await resp.json();
+      if (r.status === 'complete') {
+        const msgs = document.getElementById('chat-messages');
+        const waiting = msgs.querySelector('.chat-waiting');
+        if (waiting) waiting.remove();
+        addChatMessage('agent', r.response, agent);
+        return;
+      }
+    } catch(e) { /* retry */ }
+  }
+  const msgs = document.getElementById('chat-messages');
+  const waiting = msgs.querySelector('.chat-waiting');
+  if (waiting) waiting.remove();
+  addChatMessage('system', 'Timeout — no response after 90s. The agent may still be processing.');
+}
+
+const MAX_CHAT_MESSAGES = 6; // 3 exchanges (you + agent)
+
+function addChatMessage(role, text, agentName) {
+  const agent = document.getElementById('chat-agent').value;
+  chatMessages.push({role, text, agentName: agentName || agent, forAgent: agent});
+
+  // Trim to last MAX messages for current agent
+  const agentMsgs = chatMessages.filter(m => m.forAgent === agent);
+  while (agentMsgs.length > MAX_CHAT_MESSAGES) {
+    const oldest = agentMsgs.shift();
+    const idx = chatMessages.indexOf(oldest);
+    if (idx >= 0) chatMessages.splice(idx, 1);
+  }
+
+  renderChat();
+  sessionStorage.setItem('aimos_chat', JSON.stringify(chatMessages));
+}
+
+function renderChat() {
+  const box = document.getElementById('chat-messages');
+  const agent = document.getElementById('chat-agent').value;
+  const agentMsgs = chatMessages.filter(m => m.forAgent === agent);
+
+  if (agentMsgs.length === 0) {
+    box.innerHTML = '<span style="color:var(--text-dim);">Select an agent and send a message.</span>';
+    return;
+  }
+  box.innerHTML = '';
+  for (const msg of agentMsgs) {
+    const div = document.createElement('div');
+    div.style.marginBottom = '8px';
+    if (msg.role === 'you') {
+      div.innerHTML = '<span style="color:var(--blue);font-weight:600;">You:</span> <span style="color:var(--text);">' + escapeHtml(msg.text) + '</span>';
+    } else if (msg.role === 'agent') {
+      div.innerHTML = '<span style="color:var(--green);font-weight:600;">' + (msg.agentName || 'Agent') + ':</span> <span style="color:var(--text);">' + escapeHtml(msg.text) + '</span>';
+    } else {
+      div.innerHTML = '<span style="color:var(--text-dim);font-style:italic;">' + escapeHtml(msg.text) + '</span>';
+      div.classList.add('chat-waiting');
+    }
+    box.appendChild(div);
+  }
+  box.scrollTop = box.scrollHeight;
+}
+
+// Re-render when agent changes
+document.getElementById('chat-agent').addEventListener('change', function() {
+  sessionStorage.setItem('aimos_chat_agent', this.value);
+  renderChat();
+});
+
+// ── Backup ───────────────────────────────────────────────────────────────
+let backupRunning = false;
+async function runBackup() {
+  if (backupRunning) return;
+  backupRunning = true;
+  const btn = document.getElementById('backup-btn');
+  const status = document.getElementById('backup-status');
+  btn.disabled = true;
+  btn.textContent = 'Running...';
+  btn.style.opacity = '0.5';
+  status.textContent = 'Backup in progress...';
+  status.style.color = 'var(--amber)';
+  try {
+    const resp = await fetch('/api/backup/run', {method:'POST', credentials:'include'});
+    const r = await resp.json();
+    if (r.status === 'ok') {
+      status.textContent = r.file + ' (' + r.size + ')';
+      status.style.color = 'var(--green)';
+    } else {
+      status.textContent = (r.error || 'failed').substring(0, 60);
+      status.style.color = 'var(--red)';
+    }
+  } catch(e) {
+    status.textContent = e.message.substring(0, 60);
+    status.style.color = 'var(--red)';
+  }
+  backupRunning = false;
+  btn.disabled = false;
+  btn.textContent = 'Run Backup Now';
+  btn.style.opacity = '1';
+}
+
+async function refreshBackupStatus() {
+  try {
+    const resp = await fetch('/api/backup/status', {credentials:'include'});
+    const r = await resp.json();
+    const status = document.getElementById('backup-status');
+    if (r.last_backup) {
+      status.textContent = 'Last: ' + r.last_backup + ' (' + r.size + ')';
+      status.style.color = 'var(--green)';
+    } else {
+      status.textContent = 'No backups yet';
+      status.style.color = 'var(--text-dim)';
+    }
+  } catch(e) {}
+}
+refreshBackupStatus();
+</script>
+</body>
+</html>

@@ -1,0 +1,81 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# AIMOS .gitignore — v4.1.0
+# Policy: Zero secrets, zero binaries, zero user data in the repo.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# --- SECRETS & PRIVATE DATA ---
+core/.env
+configs/agents/*.env
+configs/agents.json
+!configs/agents.example.json
+configs/agents/private_*
+
+# --- PYTHON ---
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+venv/
+.venv/
+core/.venv/
+.pytest_cache/
+.mypy_cache/
+
+# --- MODELS & BINARIES (large, download separately) ---
+models/
+*.onnx
+*.onnx.json
+
+# --- DATABASE & LOGS ---
+postgres_data/
+n8n_data/
+*.db
+*.sqlite
+*.log
+logs/
+!logs/.gitkeep
+tmp/
+/tmp/aimos_agent_*.pid
+
+# --- AGENT WORKSPACES (user data stays local, but config/testplan tracked) ---
+storage/agents/*/memory.db
+storage/agents/*/persistence.db
+storage/agents/*/api_audit.log
+storage/agents/*/external_api_audit.log
+storage/agents/*/incoming/
+storage/agents/*/mailbox/
+storage/agents/*/*.pdf
+storage/agents/*/*.png
+storage/agents/*/*.jpg
+storage/agents/*/*.ogg
+storage/agents/*/*.wav
+!storage/.gitkeep
+
+# --- AUDIO & VOICE ---
+*.wav
+data/incoming/
+
+# --- AUTO-GENERATED ---
+start_agent_*.sh
+system_manifest.json
+
+# --- DEBUG & BACKUPS ---
+debug_logs_*/
+scripts/temp/
+*.bak
+*.tmp
+
+# --- OS / EDITOR ---
+.DS_Store
+Thumbs.db
+*~
+.idea/
+.vscode/
+
+# --- ARCHIVES (large, reference only) ---
+archive_old_version/
+archive_v382/
+
+# --- TOOLS & MISC ---
+.claude/
+MEMORY.md

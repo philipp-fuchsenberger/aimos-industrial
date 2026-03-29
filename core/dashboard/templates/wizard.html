@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIMOS – Agent Wizard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-base: #0a1118;
+    --bg-card: #1a2332;
+    --border: rgba(255,255,255,0.05);
+    --blue: #0070f3;
+    --green: #10b981;
+    --red: #ef4444;
+    --amber: #f59e0b;
+    --purple: #a855f7;
+    --text: #e2e8f0;
+    --text-dim: #64748b;
+    --text-muted: #475569;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg-base);
+    color: var(--text);
+    font-family: 'Inter', -apple-system, sans-serif;
+    font-size: 14px;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 32px 20px;
+  }
+
+  /* ── Layout ─────────────────────────────────────────────────────────── */
+  .wizard-wrap {
+    width: 100%;
+    max-width: 700px;
+  }
+
+  /* ── Back link ──────────────────────────────────────────────────────── */
+  a.back {
+    display: inline-block;
+    color: var(--text-dim);
+    text-decoration: none;
+    font-size: 13px;
+    font-weight: 500;
+    margin-bottom: 20px;
+    transition: color 0.15s;
+  }
+  a.back:hover { color: var(--text); }
+
+  /* ── Header ─────────────────────────────────────────────────────────── */
+  .page-header {
+    margin-bottom: 28px;
+  }
+  .page-header h1 {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text);
+    letter-spacing: -0.02em;
+    margin-bottom: 4px;
+  }
+  .page-header h1 span { color: var(--blue); }
+  .page-header .subtitle {
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+
+  /* ── Form card ──────────────────────────────────────────────────────── */
+  .form-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 28px 32px;
+  }
+
+  /* ── Section titles ─────────────────────────────────────────────────── */
+  .section-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-top: 28px;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .section-title:first-child { margin-top: 0; }
+
+  /* ── Labels & inputs ────────────────────────────────────────────────── */
+  label.field-label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 5px;
+    margin-top: 16px;
+  }
+  label.field-label:first-of-type { margin-top: 0; }
+
+  input[type="text"],
+  select,
+  textarea {
+    width: 100%;
+    background: var(--bg-base);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 9px 12px;
+    font-size: 13px;
+    font-family: 'JetBrains Mono', monospace;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  input[type="text"]:focus,
+  select:focus,
+  textarea:focus {
+    border-color: var(--blue);
+  }
+  input[type="text"]::placeholder,
+  textarea::placeholder {
+    color: var(--text-muted);
+  }
+  textarea { resize: vertical; min-height: 70px; }
+  select { cursor: pointer; }
+  .input-readonly {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .hint {
+    color: var(--text-muted);
+    font-size: 11px;
+    margin-top: 4px;
+    line-height: 1.5;
+  }
+
+  /* ── Toggle switch (Active checkbox) ────────────────────────────────── */
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 8px;
+  }
+  .toggle-switch {
+    position: relative;
+    width: 44px;
+    height: 24px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+    position: absolute;
+  }
+  .toggle-slider {
+    position: absolute;
+    inset: 0;
+    background: #334155;
+    border-radius: 12px;
+    transition: background 0.25s;
+  }
+  .toggle-slider::before {
+    content: '';
+    position: absolute;
+    width: 18px;
+    height: 18px;
+    left: 3px;
+    top: 3px;
+    background: #fff;
+    border-radius: 50%;
+    transition: transform 0.25s;
+  }
+  .toggle-switch input:checked + .toggle-slider {
+    background: var(--green);
+  }
+  .toggle-switch input:checked + .toggle-slider::before {
+    transform: translateX(20px);
+  }
+  .toggle-text {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text);
+  }
+
+  /* ── Skill / Connector pills ────────────────────────────────────────── */
+  .pills-hint {
+    color: var(--text-muted);
+    font-size: 12px;
+    margin-bottom: 10px;
+  }
+  .cat-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-top: 14px;
+    margin-bottom: 6px;
+  }
+  .cat-label:first-of-type { margin-top: 4px; }
+  .pills-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .skill-btn {
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    cursor: pointer;
+    background: transparent;
+    color: var(--text-dim);
+    font-family: 'Inter', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    user-select: none;
+    transition: all 0.15s;
+  }
+  .skill-btn:hover {
+    border-color: var(--text-muted);
+    color: var(--text);
+  }
+  .skill-btn.selected {
+    background: rgba(0,112,243,0.15);
+    color: var(--blue);
+    border-color: rgba(0,112,243,0.4);
+  }
+
+  /* ── Skill config panels ────────────────────────────────────────────── */
+  .skill-config {
+    display: none;
+    margin-top: 10px;
+    padding: 14px 16px;
+    background: rgba(0,0,0,0.25);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .skill-config.visible { display: block; }
+  .skill-config .config-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--blue);
+    margin-bottom: 8px;
+  }
+  .skill-config label.field-label { margin-top: 10px; }
+  .skill-config label.field-label:first-of-type { margin-top: 0; }
+
+  /* ── Submit button ──────────────────────────────────────────────────── */
+  .btn-submit {
+    display: block;
+    width: 100%;
+    margin-top: 28px;
+    padding: 12px;
+    background: var(--blue);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-family: 'Inter', sans-serif;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .btn-submit:hover { filter: brightness(1.15); }
+  .btn-submit:active { transform: scale(0.99); }
+
+  /* ── Result message ─────────────────────────────────────────────────── */
+  #result {
+    margin-top: 14px;
+    padding: 12px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 500;
+    display: none;
+  }
+  #result.ok {
+    background: rgba(16,185,129,0.1);
+    border: 1px solid rgba(16,185,129,0.3);
+    color: var(--green);
+  }
+  #result.err {
+    background: rgba(239,68,68,0.1);
+    border: 1px solid rgba(239,68,68,0.3);
+    color: var(--red);
+  }
+
+  /* ── Danger zone ────────────────────────────────────────────────────── */
+  .danger-zone {
+    margin-top: 28px;
+    padding-top: 20px;
+    border-top: 1px solid rgba(239,68,68,0.2);
+  }
+  .btn-danger {
+    background: transparent;
+    color: var(--red);
+    border: 1px solid rgba(239,68,68,0.3);
+    padding: 8px 20px;
+    border-radius: 6px;
+    font-family: 'Inter', sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .btn-danger:hover {
+    background: rgba(239,68,68,0.1);
+    border-color: var(--red);
+  }
+</style>
+</head>
+<body>
+
+<div class="wizard-wrap">
+
+  <a class="back" href="/">&#8592; Back to Dashboard</a>
+
+  {% set is_edit = agent_data and agent_data.name is defined %}
+  {% if is_edit %}
+    {% set cfg = agent_data.config if agent_data.config is mapping else {} %}
+    {% set sec = agent_data.env_secrets if agent_data.env_secrets is mapping else {} %}
+    {% set char = cfg.character if cfg.character is mapping else {} %}
+  {% else %}
+    {% set cfg = {} %}{% set sec = {} %}{% set char = {} %}
+  {% endif %}
+
+  <div class="page-header">
+    {% if is_edit %}
+      <h1>Edit: <span>{{ agent_data.name }}</span></h1>
+      <p class="subtitle">Changes saved to PostgreSQL agents table.</p>
+    {% else %}
+      <h1>New Agent <span>Wizard</span></h1>
+      <p class="subtitle">Creates a new agent in the database.</p>
+    {% endif %}
+  </div>
+
+  <form id="wizard-form" class="form-card" onsubmit="submitWizard(event)">
+
+    {# ── 1. Identity ──────────────────────────────────────────────────── #}
+    <div class="section-title" style="margin-top:0">Identity</div>
+
+    <label class="field-label">Agent Name (slug) *</label>
+    <input type="text" id="name" placeholder="e.g. researcher" pattern="[a-z0-9_-]+" required
+           value="{{ agent_data.name or '' }}"
+           {% if is_edit %}readonly class="input-readonly"{% endif %}>
+    <p class="hint">Lowercase, letters/digits/hyphens. Used as --id argument.</p>
+
+    <label class="field-label">Display Name</label>
+    <input type="text" id="display_name" placeholder="e.g. Researcher"
+           value="{{ cfg.display_name if cfg.display_name else '' }}">
+
+    {# ── 2. Status ────────────────────────────────────────────────────── #}
+    <div class="section-title">Status</div>
+
+    <div class="toggle-row">
+      <label class="toggle-switch">
+        <input type="checkbox" id="agent_active" {% if cfg.get('active', True) %}checked{% endif %}>
+        <span class="toggle-slider"></span>
+      </label>
+      <span class="toggle-text">Active &mdash; Agent responds to messages in auto-mode</span>
+    </div>
+    <p class="hint">Inactive agents are ignored by the orchestrator. They can only be started manually when all other agents are stopped.</p>
+
+    {# ── 3. Permissions ───────────────────────────────────────────────── #}
+    <div class="section-title">Permissions</div>
+
+    <label class="field-label">Execution Ring</label>
+    {% set mr = cfg.get('max_ring', 2) %}
+    <select id="max_ring">
+      <option value="0" {% if mr == 0 %}selected{% endif %}>Ring 0 — Read Only (search, recall, status checks)</option>
+      <option value="1" {% if mr == 1 %}selected{% endif %}>Ring 1 — Standard (send messages, write files, reminders)</option>
+      <option value="2" {% if mr == 2 or mr is none %}selected{% endif %}>Ring 2 — Full Access (external APIs, credentials, web automation)</option>
+    </select>
+    <p class="hint">Controls which tools the agent is allowed to execute. Ring 0 = read. Ring 1 = communicate + write. Ring 2 = full system access including cost-generating API calls.</p>
+
+    {# Agent-editable credentials are now checkboxes next to each credential field in the skill config panels #}
+
+    {# ── 4. Personality & Prompt ──────────────────────────────────────── #}
+    <div class="section-title">Personality &amp; Prompt</div>
+
+    <label class="field-label">Personality *</label>
+    <textarea id="char_description" placeholder="Helpful, precise, answers in English. Dry humor, asks clarifying questions when needed." required>{{ char.description or [char.nature, char.humor, char.curiosity]|select|join(' ') if char else '' }}</textarea>
+
+    <label class="field-label">System Prompt (override)</label>
+    <textarea id="system_prompt" placeholder="Leave empty for auto-prompt." style="min-height:80px">{{ cfg.system_prompt or '' }}</textarea>
+    <p class="hint">Leave empty to use the character-based auto-prompt. Only set this if you need full control over the system message.</p>
+
+    {# ── Hidden defaults (business agent hardcoded) ───────────────────── #}
+    <input type="hidden" id="vram_profile" value="{{ cfg.get('vram_profile', 'max_context') }}">
+    <input type="hidden" id="custom_num_ctx" value="{{ cfg.get('num_ctx', 14336) }}">
+    <input type="hidden" id="execution_strategy" value="{{ cfg.get('execution_strategy', 'sequential') }}">
+    <input type="hidden" id="cognitive_balance" value="{{ cfg.get('cognitive_balance', 0) }}">
+
+    {# ── Prepare skill groups ─────────────────────────────────────────── #}
+    {% set active_skills = cfg.skills or cfg.modules or [] %}
+
+    {% set connectors = [] %}
+    {% set capabilities = [] %}
+    {% for sk in skill_meta %}
+      {% if sk.category == 'connector' %}
+        {% set _ = connectors.append(sk) %}
+      {% else %}
+        {% set _ = capabilities.append(sk) %}
+      {% endif %}
+    {% endfor %}
+
+    {# ── Group capabilities by category ───────────────────────────────── #}
+    {% set cat_order = ['engineering', 'communication', 'storage', 'planning', 'intelligence', 'accounting'] %}
+    {% set cat_labels = {
+      'engineering': 'Engineering',
+      'communication': 'Communication',
+      'storage': 'Storage',
+      'planning': 'Planning',
+      'intelligence': 'Intelligence',
+      'accounting': 'Accounting'
+    } %}
+
+    {# ── 5. Skills ────────────────────────────────────────────────────── #}
+    {% if capabilities %}
+    <div class="section-title">Skills</div>
+    <p class="pills-hint">Select the skills this agent should have access to. Click to toggle.</p>
+
+    {% for cat in cat_order %}
+      {% set cat_skills = capabilities | selectattr('category', 'equalto', cat) | list %}
+      {% if cat_skills %}
+        <div class="cat-label">{{ cat_labels.get(cat, cat) }}</div>
+        <div class="pills-grid">
+          {% for sk in cat_skills %}
+          <div class="skill-btn {% if sk.name in active_skills %}selected{% endif %}"
+               data-skill="{{ sk.name }}" onclick="toggleSkill(this)">{{ sk.label }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endfor %}
+
+    {# Catch skills not in defined categories #}
+    {% set known_cats = cat_order %}
+    {% set other_skills = capabilities | rejectattr('category', 'in', known_cats) | list %}
+    {% if other_skills %}
+      <div class="cat-label">Other</div>
+      <div class="pills-grid">
+        {% for sk in other_skills %}
+        <div class="skill-btn {% if sk.name in active_skills %}selected{% endif %}"
+             data-skill="{{ sk.name }}" onclick="toggleSkill(this)">{{ sk.label }}</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+    {% endif %}
+
+    {# ── 6. Connectors ────────────────────────────────────────────────── #}
+    {% if connectors %}
+    <div class="section-title">Connectors</div>
+    <p class="pills-hint">External services this agent can connect to. Click to toggle.</p>
+    <div class="pills-grid">
+      {% for sk in connectors %}
+      <div class="skill-btn {% if sk.name in active_skills %}selected{% endif %}"
+           data-skill="{{ sk.name }}" onclick="toggleSkill(this)">{{ sk.label }}</div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {# ── Config panels (skills with config_fields) ────────────────────── #}
+    {% for sk in skill_meta %}
+      {% if sk.config_fields %}
+      <div class="skill-config {% if sk.name in active_skills %}visible{% endif %}" id="cfg-{{ sk.name }}">
+        <div class="config-title">{{ sk.label }} Settings</div>
+        {% for field in sk.config_fields %}
+          <label class="field-label">{{ field.label }}</label>
+          {% if field.type == 'textarea' %}
+            <textarea class="skill-field" data-key="{{ field.key }}"
+                      placeholder="{{ field.placeholder or '' }}">{{ (sec[field.key] if field.get('secret', true) else cfg.get(field.key|lower, '')) or '' }}</textarea>
+          {% elif field.type == 'password' %}
+            <input class="skill-field" data-key="{{ field.key }}" type="password"
+                   placeholder="{% if is_edit %}(unchanged if empty){% else %}{{ field.placeholder or '' }}{% endif %}">
+          {% else %}
+            <input class="skill-field" data-key="{{ field.key }}" type="{{ field.type or 'text' }}"
+                   value="{{ (sec[field.key] if field.get('secret', true) else cfg.get(field.key|lower, '')) or '' }}"
+                   placeholder="{{ field.placeholder or '' }}">
+          {% endif %}
+          {% if field.get('secret', true) %}
+          <label style="display:flex; align-items:center; gap:6px; margin-top:4px; cursor:pointer; font-size:10px; color:var(--text-dim);">
+            <input type="checkbox" class="editable-check" data-key="{{ field.key }}" autocomplete="off"
+                   {% if field.key in (cfg.get('agent_editable_secrets', []) or []) %}checked{% endif %}
+                   style="width:13px; height:13px; accent-color:var(--blue);">
+            Agent may edit this via chat
+          </label>
+          {% endif %}
+          {% if field.hint %}<p class="hint">{{ field.hint }}</p>{% endif %}
+        {% endfor %}
+      </div>
+      {% endif %}
+    {% endfor %}
+
+    {# ── Submit ───────────────────────────────────────────────────────── #}
+    <button type="submit" class="btn-submit">{% if is_edit %}Save Changes{% else %}Create Agent{% endif %}</button>
+    <div id="result"></div>
+
+    {# ── Danger zone (edit only) ──────────────────────────────────────── #}
+    {% if is_edit %}
+    <div class="danger-zone">
+      <button type="button" class="btn-danger" onclick="deleteAgent('{{ agent_data.name }}')">Delete Agent</button>
+    </div>
+    {% endif %}
+
+  </form>
+</div>
+
+<script>
+const selectedSkills = new Set();
+document.querySelectorAll('.skill-btn.selected').forEach(el => selectedSkills.add(el.dataset.skill));
+
+function toggleSkill(el) {
+  const sk = el.dataset.skill;
+  const panel = document.getElementById('cfg-' + sk);
+  if (selectedSkills.has(sk)) {
+    selectedSkills.delete(sk);
+    el.classList.remove('selected');
+    if (panel) panel.classList.remove('visible');
+  } else {
+    selectedSkills.add(sk);
+    el.classList.add('selected');
+    if (panel) panel.classList.add('visible');
+  }
+}
+
+async function submitWizard(e) {
+  e.preventDefault();
+  const submitBtn = document.querySelector('button[type=submit]');
+  submitBtn.disabled = true;
+  submitBtn.textContent = 'Saving...';
+  const res = document.getElementById('result');
+
+  const data = {
+    name: document.getElementById('name').value.trim().toLowerCase(),
+    display_name: document.getElementById('display_name').value.trim(),
+    active: document.getElementById('agent_active').checked,
+    execution_strategy: document.getElementById('execution_strategy').value,
+    vram_profile: document.getElementById('vram_profile').value,
+    cognitive_balance: parseInt(document.getElementById('cognitive_balance').value),
+    num_ctx: parseInt(document.getElementById('custom_num_ctx').value),
+    max_ring: parseInt(document.getElementById('max_ring').value),
+    agent_editable_secrets: [...document.querySelectorAll('.editable-check:checked')].map(el => el.dataset.key).join(', '),
+    char_description: document.getElementById('char_description').value.trim(),
+    system_prompt: document.getElementById('system_prompt').value.trim(),
+    skills: [...selectedSkills],
+    skill_config: {},
+  };
+
+  // Collect all visible skill config fields
+  document.querySelectorAll('.skill-config.visible .skill-field').forEach(el => {
+    const v = el.value.trim();
+    if (v) data.skill_config[el.dataset.key] = v;
+  });
+
+  try {
+    const resp = await fetch('/api/wizard', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(data)
+    });
+    const r = await resp.json();
+    if (r.status === 'saved') {
+      res.className = 'ok'; res.style.display = 'block';
+      res.textContent = r.is_new ? `Agent "${r.name}" created! Redirecting...` : `Agent "${r.name}" updated!`;
+      if (r.is_new) setTimeout(() => location.href = '/wizard/' + r.name, 1500);
+    } else {
+      res.className = 'err'; res.style.display = 'block';
+      res.textContent = r.error || 'Unknown error';
+    }
+  } catch(err) {
+    res.className = 'err'; res.style.display = 'block';
+    res.textContent = err.message;
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = document.getElementById('name').hasAttribute('readonly') ? 'Save Changes' : 'Create Agent';
+  }
+}
+
+async function deleteAgent(name) {
+  if (!confirm(`Delete agent "${name}"? This cannot be undone.`)) return;
+  await fetch(`/api/agents/${name}`, {method:'DELETE'});
+  location.href = '/';
+}
+</script>
+</body>
+</html>

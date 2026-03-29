@@ -1,0 +1,22 @@
+{
+    "customer_balance": {
+        "sql": "SELECT CARI_KOD, CARI_ISIM, BORC, ALACAK, (BORC - ALACAK) AS BAKIYE FROM CARI_HESAPLAR WHERE CARI_ISIM LIKE ?",
+        "params": ["customer_name"],
+        "note": "ETA V8 default table. Adjust for your version."
+    },
+    "unpaid_invoices": {
+        "sql": "SELECT FATURA_NO, MUSTERI, TUTAR, VADE_TARIH FROM FATURALAR WHERE ODENDI = 0 AND VADE_TARIH < ? ORDER BY VADE_TARIH",
+        "params": ["cutoff_date"],
+        "note": "Overdue invoices. cutoff_date = today - days_overdue"
+    },
+    "search_transactions": {
+        "sql": "SELECT TARIH, ACIKLAMA, TUTAR, TIP FROM HAREKETLER WHERE ACIKLAMA LIKE ? AND TARIH BETWEEN ? AND ? ORDER BY TARIH DESC",
+        "params": ["query", "date_from", "date_to"],
+        "note": "Transaction search by keyword and date range"
+    },
+    "daily_summary": {
+        "sql": "SELECT TIP, COUNT(*) as ADET, SUM(TUTAR) as TOPLAM FROM HAREKETLER WHERE TARIH = ? GROUP BY TIP",
+        "params": ["today"],
+        "note": "Daily transaction summary grouped by type"
+    }
+}
