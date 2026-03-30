@@ -310,7 +310,7 @@ def cleanup_test_messages(agent_name: str):
 
 def main():
     parser = argparse.ArgumentParser(description="AIMOS CR Validation")
-    parser.add_argument("--agent", default="agent1", help="Agent to test (default: agent1)")
+    parser.add_argument("--agent", default="agent1", help="Agent to test (default: neo)")
     parser.add_argument("--dry-run", action="store_true", help="Only check DB + structure, no message injection")
     parser.add_argument("--timeout", type=int, default=30, help="Seconds to wait for processing (default: 30)")
     args = parser.parse_args()

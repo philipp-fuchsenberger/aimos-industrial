@@ -279,6 +279,18 @@ class StructuralSkill(BaseSkill):
         except Exception:
             return _DEFAULT_PRICES
 
+    @staticmethod
+    def _safe_read_updated(prices_path) -> str:
+        """CR-195: Safely read 'updated' field from prices JSON with error handling."""
+        if not prices_path.exists():
+            return "never"
+        try:
+            data = json.loads(prices_path.read_text(encoding="utf-8"))
+            return data.get("updated", "unknown")
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(f"Failed to read prices file: {exc}")
+            return "unknown (read error)"
+
     async def execute_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
         if tool_name == "analyze_beam":
             return self._analyze_beam(arguments)
@@ -364,23 +376,23 @@ class StructuralSkill(BaseSkill):
         result = [
             f"=== Beam Analysis: {profile_name} ({grade}) ===",
             f"Span: {span:.1f} m | Load: {load:.1f} kN/m | Support: {support}",
-            f"",
-            f"Results:",
+            "",
+            "Results:",
             f"  Max Moment:     {max_M:.1f} kN·m",
             f"  Max Shear:      {max_V:.1f} kN",
             f"  Max Deflection: {d_mm:.1f} mm (limit: {d_limit:.1f} mm = L/{250})",
-            f"",
-            f"Capacity Check:",
+            "",
+            "Capacity Check:",
             f"  Moment Capacity: {M_capacity:.1f} kN·m ({grade}, Wy={profile['Wy']:.0f} cm³)",
             f"  Utilization:     {util_ratio:.1%}",
             f"  Status:          {'OK' if util_ratio <= 1.0 else 'OVERLOADED — increase profile!'}",
             f"  Deflection:      {'OK' if d_mm <= d_limit else 'EXCEEDS LIMIT'}",
-            f"",
+            "",
             f"Profile: {profile_name} — {profile['kg_m']} kg/m, h={profile['h']}mm",
         ]
 
         if util_ratio > 0.9:
-            result.append(f"\nWarning: Utilization > 90% — consider upgrading to next size.")
+            result.append("\nWarning: Utilization > 90% — consider upgrading to next size.")
 
         logger.info(f"[Structural] Beam analysis: {profile_name}, M={max_M:.1f}, util={util_ratio:.1%}")
         return "\n".join(result)
@@ -474,7 +486,7 @@ class StructuralSkill(BaseSkill):
             total_cost += cost
             lines.append(f"  {count}x {name} @ {length}m: {weight:.0f} kg × {price_per_kg:.1f} ₺/kg = {cost:,.0f} ₺")
 
-        lines.append(f"")
+        lines.append("")
         lines.append(f"TOTAL: {total_weight:,.0f} kg = {total_weight/1000:.1f} tons")
         lines.append(f"TOTAL COST: {total_cost:,.0f} ₺ ({total_cost/total_weight:.1f} ₺/kg avg)")
 
@@ -518,7 +530,7 @@ class StructuralSkill(BaseSkill):
             "2. Update the prices by editing the file with write_file:\n"
             f"   write_file('market_prices.json', ...)\n"
             "3. Current price file location: workspace/market_prices.json\n"
-            f"4. Last updated: {json.loads(prices_path.read_text()).get('updated', 'unknown') if prices_path.exists() else 'never'}"
+            f"4. Last updated: {self._safe_read_updated(prices_path)}"
         )
 
     def _read_dxf(self, filename: str) -> str:
@@ -605,13 +617,13 @@ class StructuralSkill(BaseSkill):
                 f"=== DXF Analysis: {filename} ===",
                 f"Format: {doc.dxfversion}",
                 bb_info,
-                f"",
+                "",
                 f"Layers ({len(layers)}):",
             ]
             for l in layers[:20]:
                 lines.append(f"  {l}")
 
-            lines.append(f"\nGeometry:")
+            lines.append("\nGeometry:")
             for t, c in sorted(type_counts.items(), key=lambda x: -x[1]):
                 lines.append(f"  {t}: {c}")
 

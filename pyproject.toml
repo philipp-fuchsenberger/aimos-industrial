@@ -1,0 +1,23 @@
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+# E501: line too long (existing code has long lines)
+# F841: local variable assigned but never used (some intentional patterns)
+# E402: module level import not at top of file (conditional imports)
+# F401: imported but unused (re-exports in __init__.py)
+# E722: bare except (legacy exception handling)
+ignore = ["E501", "F841", "E402", "F401", "E722", "E721", "E741", "E701"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: Tests requiring running DB and agents (deselect with '-m not integration')",
+]
+asyncio_mode = "auto"
+
+[tool.bandit]
+skips = ["B101", "B603", "B607"]

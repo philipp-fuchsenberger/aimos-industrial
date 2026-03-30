@@ -239,7 +239,9 @@ class HybridReasoningSkill(BaseSkill):
     name = "hybrid_reasoning"
     display_name = "Hybrid Reasoning (External LLM)"
 
-    def __init__(self, agent_name: str = "", agent_config: dict | None = None, **kwargs):
+    def __init__(self, agent_name: str = "", agent_config: dict | None = None,
+                 secrets: dict[str, str] | None = None, **kwargs):
+        self._init_secrets(secrets)
         self._agent_name = agent_name
         cfg = agent_config or {}
         self._anon_level = cfg.get("hybrid_anon_level", "strict")
@@ -277,7 +279,7 @@ class HybridReasoningSkill(BaseSkill):
         ]
 
     def is_available(self) -> bool:
-        return bool(os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY"))
+        return bool(self._secret("OPENROUTER_API_KEY") or self._secret("OPENAI_API_KEY"))
 
     def _get_vault(self) -> Vault:
         if self._vault is None:
@@ -374,7 +376,7 @@ class HybridReasoningSkill(BaseSkill):
         agent_secrets = {}
         for key in ("TELEGRAM_BOT_TOKEN", "EMAIL_PASSWORD", "OPENROUTER_API_KEY",
                      "OPENAI_API_KEY", "BRAVE_API_KEY"):
-            val = os.getenv(key, "")
+            val = self._secret(key)
             if val:
                 agent_secrets[key] = val
 
@@ -471,8 +473,8 @@ class HybridReasoningSkill(BaseSkill):
 
         Priority: Anthropic direct (sk-ant-*) → OpenRouter (sk-or-*) → OpenAI.
         """
-        openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
-        openai_key = os.getenv("OPENAI_API_KEY", "")
+        openrouter_key = self._secret("OPENROUTER_API_KEY")
+        openai_key = self._secret("OPENAI_API_KEY")
 
         # Auto-detect: Anthropic direct key stored as OPENROUTER_API_KEY
         if openrouter_key.startswith("sk-ant-"):
@@ -548,7 +550,7 @@ class HybridReasoningSkill(BaseSkill):
         user_question = question.strip() if question.strip() else default_q
 
         # Get API key
-        openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
+        openrouter_key = self._secret("OPENROUTER_API_KEY")
         if not openrouter_key.startswith("sk-ant-"):
             return "Fehler: Bildanalyse benoetigt Anthropic API Key (sk-ant-*)"
 

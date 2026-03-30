@@ -257,7 +257,7 @@ class ProjectManagementSkill(BaseSkill):
                 task["notes"] += f"\n[{now[:10]}] {notes}"
             else:
                 task["notes"] = f"[{now[:10]}] {notes}"
-            task["history"].append({"action": f"note added", "at": now})
+            task["history"].append({"action": "note added", "at": now})
             changes.append("note added")
 
         if not changes:

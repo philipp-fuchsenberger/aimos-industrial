@@ -34,6 +34,19 @@ class BaseSkill(ABC):
     name: str           # Eindeutiger Skill-Bezeichner, muss in der Subklasse gesetzt werden
     display_name: str = ""  # Human-readable name for Dashboard UI
 
+    def _init_secrets(self, secrets: dict[str, str] | None = None) -> None:
+        """CR-222: Store per-instance secrets dict. Call from subclass __init__."""
+        self._secrets: dict[str, str] = dict(secrets) if secrets else {}
+
+    def _secret(self, key: str, default: str = "") -> str:
+        """Resolve a secret: instance secrets (agent-scoped) > os.environ > default.
+
+        CR-222: Avoids global os.environ race conditions when multiple agents
+        run in the same process.
+        """
+        secrets = getattr(self, "_secrets", {})
+        return secrets.get(key) or os.getenv(key, default)
+
     @staticmethod
     def _sanitize_agent_name(name: str) -> str:
         """Sanitize agent name for filesystem use. Prevents path traversal."""

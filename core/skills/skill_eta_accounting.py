@@ -43,13 +43,15 @@ class ETAAccountingBase(BaseSkill):
     name = "eta_accounting"
     display_name = "ETA Accounting"
 
-    def __init__(self, agent_name: str = "", agent_config: dict | None = None, **kwargs):
+    def __init__(self, agent_name: str = "", agent_config: dict | None = None,
+                 secrets: dict[str, str] | None = None, **kwargs):
+        self._init_secrets(secrets)
         self._agent_name = agent_name
-        self._host = os.getenv("ETA_DB_HOST", "").strip()
-        self._port = int(os.getenv("ETA_DB_PORT", str(self._default_port())).strip() or self._default_port())
-        self._db_name = os.getenv("ETA_DB_NAME", "").strip()
-        self._user = os.getenv("ETA_DB_USER", "").strip()
-        self._password = os.getenv("ETA_DB_PASSWORD", "").strip()
+        self._host = self._secret("ETA_DB_HOST").strip()
+        self._port = int(self._secret("ETA_DB_PORT", str(self._default_port())).strip() or self._default_port())
+        self._db_name = self._secret("ETA_DB_NAME").strip()
+        self._user = self._secret("ETA_DB_USER").strip()
+        self._password = self._secret("ETA_DB_PASSWORD").strip()
         self._mapping = self._load_mapping(agent_name)
 
     def _default_port(self) -> int:

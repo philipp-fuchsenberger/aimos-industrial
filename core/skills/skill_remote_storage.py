@@ -31,14 +31,16 @@ class RemoteStorageSkill(BaseSkill):
     name = "remote_storage"
     display_name = "Remote Storage (SFTP)"
 
-    def __init__(self, agent_name: str = "", agent_config: dict | None = None, **kwargs):
+    def __init__(self, agent_name: str = "", agent_config: dict | None = None,
+                 secrets: dict[str, str] | None = None, **kwargs):
+        self._init_secrets(secrets)
         self._agent_name = agent_name
-        self._host = os.getenv("REMOTE_SFTP_HOST", "").strip()
-        self._port = int(os.getenv("REMOTE_SFTP_PORT", "22"))
-        self._user = os.getenv("REMOTE_SFTP_USER", "").strip()
-        self._password = os.getenv("REMOTE_SFTP_PASSWORD", "").strip() or None
-        self._key_path = os.getenv("REMOTE_SFTP_KEY_PATH", "").strip() or None
-        self._base_path = os.getenv("REMOTE_SFTP_BASE_PATH", "~/aimos-shared").strip()
+        self._host = self._secret("REMOTE_SFTP_HOST").strip()
+        self._port = int(self._secret("REMOTE_SFTP_PORT", "22"))
+        self._user = self._secret("REMOTE_SFTP_USER").strip()
+        self._password = self._secret("REMOTE_SFTP_PASSWORD").strip() or None
+        self._key_path = self._secret("REMOTE_SFTP_KEY_PATH").strip() or None
+        self._base_path = self._secret("REMOTE_SFTP_BASE_PATH", "~/aimos-shared").strip()
 
     @classmethod
     def config_fields(cls) -> list[dict]:

@@ -188,7 +188,7 @@ class SharedStorageSkill(BaseSkill):
         # Verify the final path is still within allowed
         final = self._resolve_and_check(str(target))
         if not final:
-            return f"Zugriff verweigert auf Zieldatei."
+            return "Zugriff verweigert auf Zieldatei."
         try:
             target.write_text(content, encoding="utf-8")
             logger.info(f"[shared_storage] write: {target} ({len(content)} chars)")

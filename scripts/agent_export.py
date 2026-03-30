@@ -562,7 +562,7 @@ def _import_oamf_jsonl(path: Path) -> None:
         log.warning("No memory entries found in %s", path)
         return
 
-    # Derive agent name from filename: e.g. myagent.oamf.jsonl -> myagent
+    # Derive agent name from filename: e.g. myagent.oamf.jsonl -> kral
     stem = path.stem  # myagent.oamf
     agent_name = stem.split(".")[0]
     log.info("Importing %d memories for agent '%s' (from filename).", len(entries), agent_name)

@@ -46,11 +46,14 @@ async def rest_api_ask(agent_name: str, request: Request):
                 if not cur.fetchone():
                     raise HTTPException(status_code=404, detail=f"Agent '{name}' not found")
 
-                # Insert pending_message with plain text content (not JSON)
+                # Insert pending_message — use kind/sender_id/thread_id from body if provided
+                _kind = body.get("kind", "dashboard")
+                _sender_id = int(body.get("sender_id", 0))
+                _thread_id = body.get("thread_id", "")
                 cur.execute(
-                    "INSERT INTO pending_messages (agent_name, kind, sender_id, content, processed) "
-                    "VALUES (%s, 'dashboard', 0, %s, FALSE) RETURNING id",
-                    (name, text),
+                    "INSERT INTO pending_messages (agent_name, kind, sender_id, content, processed, thread_id) "
+                    "VALUES (%s, %s, %s, %s, FALSE, %s) RETURNING id",
+                    (name, _kind, _sender_id, text, _thread_id),
                 )
                 msg_id = cur.fetchone()["id"]
             conn.commit()
@@ -121,3 +124,61 @@ async def rest_api_response(agent_name: str, msg_id: int):
     except Exception as exc:
         log.error(f"REST API poll error: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@rest_api_router.get("/api/v1/helpdesk/replies", response_class=JSONResponse)
+async def rest_api_helpdesk_replies(since_id: int = 0):
+    """Poll outbound_telegram messages for the demo helpdesk (sender_id=9999999)."""
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, agent_name, content FROM pending_messages "
+                    "WHERE kind='outbound_telegram' AND sender_id=9999999 AND id > %s "
+                    "ORDER BY id ASC LIMIT 10",
+                    (since_id,),
+                )
+                rows = cur.fetchall()
+                return {"replies": [{"id": r["id"], "agent": r["agent_name"], "text": r["content"]} for r in rows]}
+    except Exception as exc:
+        log.error(f"Helpdesk poll error: {exc}")
+        return {"replies": []}
+
+
+@rest_api_router.get("/api/v1/customers/search", response_class=JSONResponse)
+async def rest_api_customer_search(q: str = ""):
+    """Search customer files for /k functionality in demo board."""
+    import re as _re
+    from pathlib import Path
+
+    query = q.strip().lower()
+    if not query or len(query) < 2:
+        return {"results": []}
+
+    cust_dir = Path("storage/customers")
+    if not cust_dir.exists():
+        return {"results": []}
+
+    results = []
+    for f in cust_dir.glob("*.json"):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            searchable = (
+                f.stem.lower() + " " +
+                data.get("name", "").lower() + " " +
+                data.get("company", "").lower() + " " +
+                data.get("email", "").lower()
+            )
+            if query in searchable:
+                results.append({
+                    "name": data.get("name", f.stem),
+                    "company": data.get("company", ""),
+                    "email": data.get("email", ""),
+                    "products": data.get("products", []),
+                    "orders": data.get("orders", []),
+                    "thread_id": data.get("thread_ids", [""])[0],
+                    "file": f.name,
+                })
+        except Exception:
+            pass
+    return {"results": results}

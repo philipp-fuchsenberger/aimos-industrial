@@ -218,7 +218,7 @@ class GermanCalendarSkill(BaseSkill):
             if start <= today <= end:
                 remaining = (end - today).days
                 lines.append(f"  School holiday: {name} (until {end.strftime('%d.%m.')}, {remaining} days left)")
-                lines.append(f"  Note: Many employees may be on vacation. Service response times could be longer.")
+                lines.append("  Note: Many employees may be on vacation. Service response times could be longer.")
                 break
 
         key = (today.month, today.day)

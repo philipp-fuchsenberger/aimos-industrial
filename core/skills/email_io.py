@@ -70,18 +70,20 @@ class EmailSkill(BaseSkill):
              "placeholder": "smtp.example.com", "hint": "SMTP server (STARTTLS, port 587)", "secret": True},
         ]
 
-    def __init__(self, agent_name: str = "", config: dict = None) -> None:
+    def __init__(self, agent_name: str = "", config: dict = None,
+                 secrets: dict[str, str] | None = None, **kwargs) -> None:
+        self._init_secrets(secrets)
         self._agent_name = agent_name
         self._config = config or {}
         self._workspace = self.workspace_path(agent_name) if agent_name else Path("storage/agents/_default")
 
     def is_available(self) -> bool:
-        return bool(os.getenv("EMAIL_ADDRESS"))
+        return bool(self._secret("EMAIL_ADDRESS"))
 
     def _credentials_complete(self) -> tuple[bool, str]:
         required = {
-            "EMAIL_ADDRESS": os.getenv("EMAIL_ADDRESS", ""),
-            "EMAIL_PASSWORD": os.getenv("EMAIL_PASSWORD", ""),
+            "EMAIL_ADDRESS": self._secret("EMAIL_ADDRESS"),
+            "EMAIL_PASSWORD": self._secret("EMAIL_PASSWORD"),
         }
         missing = [k for k, v in required.items() if not v]
         if missing:
@@ -99,9 +101,9 @@ class EmailSkill(BaseSkill):
                 f"WARNING: {msg}\n"
                 f"Tell the user to configure email settings in the dashboard.\n"
             )
-        addr = os.getenv("EMAIL_ADDRESS", "")
-        imap = os.getenv("EMAIL_IMAP_HOST", "")
-        smtp = os.getenv("EMAIL_SMTP_HOST", "")
+        addr = self._secret("EMAIL_ADDRESS")
+        imap = self._secret("EMAIL_IMAP_HOST")
+        smtp = self._secret("EMAIL_SMTP_HOST")
         return (
             f"[Email-Skill]\n"
             f"Email account: {addr}\n"
@@ -221,10 +223,10 @@ class EmailSkill(BaseSkill):
         if not ok:
             return [{"error": msg}]
 
-        addr = os.getenv("EMAIL_ADDRESS", "")
-        passwd = os.getenv("EMAIL_PASSWORD", "")
-        imap_host = os.getenv("EMAIL_IMAP_HOST", "")
-        imap_port = int(os.getenv("EMAIL_IMAP_PORT", "993"))
+        addr = self._secret("EMAIL_ADDRESS")
+        passwd = self._secret("EMAIL_PASSWORD")
+        imap_host = self._secret("EMAIL_IMAP_HOST")
+        imap_port = int(self._secret("EMAIL_IMAP_PORT", "993"))
 
         tls_ctx = _create_tls_context()
         results = []
@@ -323,10 +325,10 @@ class EmailSkill(BaseSkill):
         if not ok:
             return {"error": msg_text}
 
-        addr = os.getenv("EMAIL_ADDRESS", "")
-        passwd = os.getenv("EMAIL_PASSWORD", "")
-        smtp_host = os.getenv("EMAIL_SMTP_HOST", "")
-        smtp_port = int(os.getenv("EMAIL_SMTP_PORT", "587"))
+        addr = self._secret("EMAIL_ADDRESS")
+        passwd = self._secret("EMAIL_PASSWORD")
+        smtp_host = self._secret("EMAIL_SMTP_HOST")
+        smtp_port = int(self._secret("EMAIL_SMTP_PORT", "587"))
 
         # Build message — FROM must match EMAIL_ADDRESS exactly (SMTP policy)
         msg = email.mime.multipart.MIMEMultipart()

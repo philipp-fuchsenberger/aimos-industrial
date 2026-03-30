@@ -1039,13 +1039,13 @@ async def demo_workspace(agent_name: str):
 
 @router.get("/api/demo/status", response_class=JSONResponse)
 async def demo_status():
-    """Get status of demo agents."""
+    """Get status of demo agents (bauer_support + bauer_innendienst)."""
     try:
         with db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT name, status, pid FROM agents "
-                    "WHERE name IN ('agent_a', 'agent_b') ORDER BY name"
+                    "WHERE name IN ('agent_a', 'agent_b', 'bauer_backoffice') ORDER BY name"
                 )
                 rows = cur.fetchall()
         return [{"name": r["name"], "status": r["status"], "pid": r["pid"]} for r in rows]

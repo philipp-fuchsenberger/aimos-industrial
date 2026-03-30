@@ -11,7 +11,7 @@ Designed to run permanently alongside shared_listener.py.
 
 Usage:
   python scripts/voice_listener.py                          # default: agent=voice_agent, device=default
-  python scripts/voice_listener.py --agent voice_agent --device 7  # USB speaker
+  python scripts/voice_listener.py --agent voice_agent --device 7  # Jabra Speak
   python scripts/voice_listener.py --device 9                # PipeWire tunnel
 
 Audio Tunneling (remote mic via WLAN):

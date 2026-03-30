@@ -44,7 +44,8 @@ class FileOpsSkill(BaseSkill):
     name = "file_ops"
     display_name = "Office (PDF/Word/ZIP)"
 
-    def __init__(self, agent_name: str = "") -> None:
+    def __init__(self, agent_name: str = "", secrets: dict[str, str] | None = None, **kwargs) -> None:
+        self._init_secrets(secrets)
         self._agent_name = agent_name
         self._workspace = self.workspace_path(agent_name) if agent_name else Path("storage/agents/_default")
 

@@ -83,7 +83,7 @@ app.add_middleware(
 #  Database Helpers (shared with routes.py)  — CR-158: pooled connections
 # ══════════════════════════════════════════════════════════════════════════════
 
-from core.db_pool import get_conn, put_conn
+from core.db_pool import get_conn, put_conn, db_connection
 
 
 def _db_connect():
@@ -104,19 +104,18 @@ def _db_release(conn):
 
 def _is_orchestrator_on() -> bool:
     try:
-        conn = _db_connect()
-        with conn.cursor() as cur:
-            cur.execute("SELECT value FROM global_settings WHERE key='orchestrator_mode'")
-            row = cur.fetchone()
-        _db_release(conn)
-        if not row:
-            return False
-        val = row["value"]
-        if isinstance(val, str):
-            val = json.loads(val)
-        if isinstance(val, dict):
-            return val.get("enabled", False) is True
-        return bool(val)
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM global_settings WHERE key='orchestrator_mode'")
+                row = cur.fetchone()
+            if not row:
+                return False
+            val = row["value"]
+            if isinstance(val, str):
+                val = json.loads(val)
+            if isinstance(val, dict):
+                return val.get("enabled", False) is True
+            return bool(val)
     except Exception:
         return False
 
@@ -124,14 +123,13 @@ def _is_orchestrator_on() -> bool:
 def _fetch_agents() -> list[dict]:
     """Fetch agents with PID verification from DB pid column + psutil."""
     try:
-        conn = _db_connect()
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT name, status, config, pid, created_at, updated_at "
-                "FROM public.agents ORDER BY name"
-            )
-            rows = cur.fetchall()
-        _db_release(conn)
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT name, status, config, pid, created_at, updated_at "
+                    "FROM public.agents ORDER BY name"
+                )
+                rows = cur.fetchall()
     except Exception as exc:
         log.warning(f"DB agents: {exc}")
         return []
@@ -155,15 +153,14 @@ def _fetch_agents() -> list[dict]:
 def _fetch_last_activity() -> list[dict]:
     """Last 5 processed messages across all agents."""
     try:
-        conn = _db_connect()
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT agent_name, kind, LEFT(content, 60) as preview, created_at "
-                "FROM pending_messages WHERE processed=TRUE "
-                "ORDER BY id DESC LIMIT 5"
-            )
-            rows = cur.fetchall()
-        _db_release(conn)
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT agent_name, kind, LEFT(content, 60) as preview, created_at "
+                    "FROM pending_messages WHERE processed=TRUE "
+                    "ORDER BY id DESC LIMIT 5"
+                )
+                rows = cur.fetchall()
         result = []
         for r in rows:
             d = dict(r)
@@ -177,15 +174,14 @@ def _fetch_last_activity() -> list[dict]:
 
 def _fetch_pending_count() -> dict[str, int]:
     try:
-        conn = _db_connect()
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT agent_name, COUNT(*) AS cnt FROM public.pending_messages "
-                "WHERE processed=FALSE AND kind NOT LIKE 'outbound_%%' "
-                "GROUP BY agent_name"
-            )
-            rows = cur.fetchall()
-        _db_release(conn)
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT agent_name, COUNT(*) AS cnt FROM public.pending_messages "
+                    "WHERE processed=FALSE AND kind NOT LIKE 'outbound_%%' "
+                    "GROUP BY agent_name"
+                )
+                rows = cur.fetchall()
         return {r["agent_name"]: r["cnt"] for r in rows}
     except Exception:
         return {}
@@ -194,16 +190,15 @@ def _fetch_pending_count() -> dict[str, int]:
 def _fetch_pending_detail() -> list[dict]:
     """Pending messages with kind breakdown for queue display."""
     try:
-        conn = _db_connect()
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT agent_name, kind, COUNT(*) AS cnt "
-                "FROM public.pending_messages WHERE processed=FALSE "
-                "AND kind NOT LIKE 'outbound_%%' "
-                "GROUP BY agent_name, kind ORDER BY agent_name, kind"
-            )
-            rows = cur.fetchall()
-        _db_release(conn)
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT agent_name, kind, COUNT(*) AS cnt "
+                    "FROM public.pending_messages WHERE processed=FALSE "
+                    "AND kind NOT LIKE 'outbound_%%' "
+                    "GROUP BY agent_name, kind ORDER BY agent_name, kind"
+                )
+                rows = cur.fetchall()
         return [dict(r) for r in rows]
     except Exception:
         return []
@@ -211,11 +206,10 @@ def _fetch_pending_detail() -> list[dict]:
 
 def _fetch_global_settings() -> list[dict]:
     try:
-        conn = _db_connect()
-        with conn.cursor() as cur:
-            cur.execute("SELECT key, value, updated_at FROM public.global_settings ORDER BY key")
-            rows = cur.fetchall()
-        _db_release(conn)
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT key, value, updated_at FROM public.global_settings ORDER BY key")
+                rows = cur.fetchall()
         return [dict(r) for r in rows]
     except Exception:
         return []

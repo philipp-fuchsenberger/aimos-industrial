@@ -30,13 +30,12 @@ class BraveSearchSkill(BaseSkill):
     name = "brave_search"
     display_name = "Web-Search (Brave)"
 
-    def __init__(self, **kwargs):
-        # Accept agent_name etc. but don't need them
-        pass
+    def __init__(self, secrets: dict[str, str] | None = None, **kwargs):
+        self._init_secrets(secrets)
 
     def is_available(self) -> bool:
         """True wenn BRAVE_API_KEY gesetzt ist."""
-        return bool(os.getenv("BRAVE_API_KEY"))
+        return bool(self._secret("BRAVE_API_KEY"))
 
     async def enrich_context(self, user_text: str) -> str:
         """Führt eine Brave-Suche durch und gibt Top-Ergebnisse als Kontext zurück.
@@ -111,7 +110,7 @@ class BraveSearchSkill(BaseSkill):
             )
             return []
 
-        api_key = os.getenv("BRAVE_API_KEY", "")
+        api_key = self._secret("BRAVE_API_KEY")
         if not api_key:
             return []
 

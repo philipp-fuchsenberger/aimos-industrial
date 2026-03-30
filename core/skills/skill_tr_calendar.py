@@ -147,7 +147,8 @@ class TurkishCalendarSkill(BaseSkill):
     name = "tr_calendar_awareness"
     display_name = "Turkish Calendar Awareness"
 
-    def __init__(self, config: dict | None = None):
+    def __init__(self, config: dict | None = None, secrets: dict[str, str] | None = None, **kwargs):
+        self._init_secrets(secrets)
         self._config = config or {}
 
     # ------------------------------------------------------------------

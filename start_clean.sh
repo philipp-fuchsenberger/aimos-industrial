@@ -60,7 +60,7 @@ echo "  PID=$!"
 
 # Optional: Voice Listener (start with --voice flag)
 if [[ "$1" == "--voice" || "$AIMOS_VOICE" == "1" ]]; then
-    VOICE_AGENT="${VOICE_AGENT:-voice_agent}"
+    VOICE_AGENT="${VOICE_AGENT:-leyla}"
     VOICE_DEVICE="${VOICE_DEVICE:-}"
     VOICE_OUT_DEVICE="${VOICE_OUT_DEVICE:-}"
     echo "--- Starting Voice Listener (Agent: $VOICE_AGENT) ---"

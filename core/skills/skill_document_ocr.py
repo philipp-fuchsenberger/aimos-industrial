@@ -32,7 +32,9 @@ class DocumentOCRSkill(BaseSkill):
 
     SKILL_NAME = "document_ocr"
 
-    def __init__(self, agent_name: str, config: dict):
+    def __init__(self, agent_name: str, config: dict,
+                 secrets: dict[str, str] | None = None, **kwargs):
+        self._init_secrets(secrets)
         self._agent_name = agent_name
         self._config = config
 
@@ -160,7 +162,8 @@ class DocumentOCRSkill(BaseSkill):
         logger.info(f"[OCR] Tier 3: Claude Vision on {len(ocr_failed_pages)} pages")
         try:
             from core.skills.skill_hybrid_reasoning import HybridReasoningSkill
-            hr = HybridReasoningSkill(self._agent_name, self._config)
+            hr = HybridReasoningSkill(self._agent_name, self._config,
+                                       secrets=getattr(self, "_secrets", {}))
             if not hr.is_available():
                 logger.warning("[OCR] Tier 3 unavailable — no API key")
             else:

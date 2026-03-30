@@ -1579,6 +1579,9 @@ async def _run_outbound_sender(agents: list[dict], shutdown: asyncio.Event):
                 token = tokens.get(agent)
                 if not token or not chat_id:
                     continue
+                # Skip demo helpdesk messages — delivered via dashboard, not Telegram
+                if int(chat_id) == 9999999:
+                    continue
 
                 try:
                     async with httpx.AsyncClient(timeout=30) as client:

@@ -63,7 +63,9 @@ class MailMonitorSkill(BaseSkill):
     name = "mail_monitor"
     display_name = "Mail Monitor (POP3 read-only)"
 
-    def __init__(self, agent_name: str = "", agent_config: dict | None = None, **kwargs):
+    def __init__(self, agent_name: str = "", agent_config: dict | None = None,
+                 secrets: dict[str, str] | None = None, **kwargs):
+        self._init_secrets(secrets)
         self._agent_name = agent_name
         self._mailbox_dir: Path | None = None
         if agent_name:
@@ -82,7 +84,7 @@ class MailMonitorSkill(BaseSkill):
         ]
 
     def is_available(self) -> bool:
-        return bool(os.getenv("POP3_HOST") and os.getenv("POP3_USER") and os.getenv("POP3_PASSWORD"))
+        return bool(self._secret("POP3_HOST") and self._secret("POP3_USER") and self._secret("POP3_PASSWORD"))
 
     def _get_known_uids(self) -> set[str]:
         """Load already-fetched UIDs from memory.db/skill_state."""
@@ -182,10 +184,10 @@ class MailMonitorSkill(BaseSkill):
 
     def _fetch_pop3(self) -> str:
         """Fetch new emails via POP3 SSL. Does NOT delete or mark as read."""
-        host = os.getenv("POP3_HOST", "")
-        port = int(os.getenv("POP3_PORT", "995"))
-        user = os.getenv("POP3_USER", "")
-        passwd = os.getenv("POP3_PASSWORD", "")
+        host = self._secret("POP3_HOST")
+        port = int(self._secret("POP3_PORT", "995"))
+        user = self._secret("POP3_USER")
+        passwd = self._secret("POP3_PASSWORD")
 
         if not host or not user or not passwd:
             return "Fehler: POP3-Zugangsdaten nicht konfiguriert (POP3_HOST, POP3_USER, POP3_PASSWORD)."

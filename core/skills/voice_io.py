@@ -43,54 +43,55 @@ class VoiceIOSkill(BaseSkill):
     name = "voice_io"
     display_name = "Voice I/O (Mic/Speaker)"
 
-    def __init__(self) -> None:
+    def __init__(self, secrets: dict[str, str] | None = None, **kwargs) -> None:
+        self._init_secrets(secrets)
         from core.config import Config
         self._whisper_model_name = Config.WHISPER_MODEL
         # CR-131: Whisper always on CPU — Qwen 3.5:27b uses ~24GB VRAM, no room for Whisper GPU
-        self._whisper_device     = os.getenv("WHISPER_DEVICE", "cpu")
-        self._whisper_compute    = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
-        self._whisper_language   = os.getenv("WHISPER_LANGUAGE", "de")
-        self._whisper_beam_size  = int(os.getenv("WHISPER_BEAM_SIZE", "3"))
+        self._whisper_device     = self._secret("WHISPER_DEVICE", "cpu")
+        self._whisper_compute    = self._secret("WHISPER_COMPUTE_TYPE", "float16")
+        self._whisper_language   = self._secret("WHISPER_LANGUAGE", "de")
+        self._whisper_beam_size  = int(self._secret("WHISPER_BEAM_SIZE", "3"))
 
-        self._piper_exe        = _resolve_path(os.getenv("PIPER_EXECUTABLE", "/home/philipp/AIMOS/models/piper/piper"))
-        self._piper_voice_path = _resolve_path(os.getenv("PIPER_VOICE_PATH", ""))
+        self._piper_exe        = _resolve_path(self._secret("PIPER_EXECUTABLE", "/home/philipp/AIMOS/models/piper/piper"))
+        self._piper_voice_path = _resolve_path(self._secret("PIPER_VOICE_PATH"))
 
         # webrtcvad: 0 = least aggressive (allows more speech),
         #            3 = most aggressive (filters noise strictly)
-        self._vad_aggressiveness = int(os.getenv("VOICE_VAD_AGGRESSIVENESS", "3"))
+        self._vad_aggressiveness = int(self._secret("VOICE_VAD_AGGRESSIVENESS", "3"))
         # Frame size for webrtcvad. Must be 10, 20, or 30 ms.
-        self._vad_frame_ms       = int(os.getenv("VOICE_VAD_FRAME_MS", "30"))
+        self._vad_frame_ms       = int(self._secret("VOICE_VAD_FRAME_MS", "30"))
         # End-of-speech: trigger when this fraction of the ring buffer is silent.
         # 0.85 = 85 % of the last _vad_window_sec must be non-speech.
-        self._vad_silence_ratio  = float(os.getenv("VOICE_VAD_SILENCE_RATIO", "0.85"))
+        self._vad_silence_ratio  = float(self._secret("VOICE_VAD_SILENCE_RATIO", "0.85"))
         # Duration of the ring-buffer lookback window (seconds).
         # 0.6s = aggressive cutoff for low-latency conversation.
-        self._vad_window_sec     = float(os.getenv("VOICE_VAD_WINDOW_SEC", "0.6"))
+        self._vad_window_sec     = float(self._secret("VOICE_VAD_WINDOW_SEC", "0.6"))
         # Pre-roll: frames captured before speech onset to keep first syllable.
-        self._pre_roll_ms        = int(os.getenv("VOICE_PRE_ROLL_MS", "300"))
+        self._pre_roll_ms        = int(self._secret("VOICE_PRE_ROLL_MS", "300"))
         # Hard maximum recording length (seconds).
-        self._record_limit       = float(os.getenv("VOICE_RECORD_LIMIT", "60"))
+        self._record_limit       = float(self._secret("VOICE_RECORD_LIMIT", "60"))
         # Minimum speech duration before we even attempt transcription.
-        self._min_speech_sec     = float(os.getenv("VOICE_MIN_SPEECH_SEC", "0.4"))
+        self._min_speech_sec     = float(self._secret("VOICE_MIN_SPEECH_SEC", "0.4"))
         # Minimum word count in the transcript — filters "ähm", single grunts, etc.
-        self._min_words          = int(os.getenv("VOICE_MIN_WORDS", "2"))
+        self._min_words          = int(self._secret("VOICE_MIN_WORDS", "2"))
 
         # webrtcvad only supports 8 / 16 / 32 / 48 kHz — fix to 16 kHz.
         self._sample_rate        = 16000
 
-        _input_idx = os.getenv("AUDIO_INPUT_INDEX", "").strip()
+        _input_idx = self._secret("AUDIO_INPUT_INDEX").strip()
         self._input_device: Optional[int] = int(_input_idx) if _input_idx else None
 
-        _output_idx = os.getenv("AUDIO_OUTPUT_INDEX", "").strip()
+        _output_idx = self._secret("AUDIO_OUTPUT_INDEX").strip()
         self._output_device: Optional[int] = int(_output_idx) if _output_idx else None
 
         # Target sample rate for the output device (Pipewire/Jabra: 44100 Hz).
         # Piper voices typically produce 22050 Hz; _resample_audio() bridges the gap.
-        self._output_sr = int(os.getenv("AUDIO_OUTPUT_SAMPLERATE", "44100"))
+        self._output_sr = int(self._secret("AUDIO_OUTPUT_SAMPLERATE", "44100"))
 
         # Inter-sentence silence (ms). Played via sd.sleep() after each sentence
         # with echo-guard OFF so the user can interrupt before the next sentence.
-        self._tts_sentence_pause_ms = int(os.getenv("TTS_SENTENCE_PAUSE_MS", "400"))
+        self._tts_sentence_pause_ms = int(self._secret("TTS_SENTENCE_PAUSE_MS", "400"))
 
         self._model      = None
         self._backend    = None

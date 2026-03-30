@@ -56,7 +56,9 @@ class WebAutomationSkill(BaseSkill):
     name = "web_automation"
     display_name = "Web Automation (Browser)"
 
-    def __init__(self, agent_name: str = "", agent_config: dict | None = None, **kwargs):
+    def __init__(self, agent_name: str = "", agent_config: dict | None = None,
+                 secrets: dict[str, str] | None = None, **kwargs):
+        self._init_secrets(secrets)
         self._agent_name = agent_name
         cfg = agent_config or {}
         self._flows: dict = cfg.get("web_flows", {})
@@ -124,10 +126,10 @@ class WebAutomationSkill(BaseSkill):
         return f"Unbekanntes Tool: {tool_name}"
 
     def _resolve_credential(self, key: str) -> str:
-        """Resolve a credential key from environment. Never log the value."""
-        val = os.getenv(key, "")
+        """Resolve a credential key from secrets (CR-222) or environment. Never log the value."""
+        val = self._secret(key)
         if not val:
-            logger.warning(f"[WebAuto] Credential '{key}' not found in env")
+            logger.warning(f"[WebAuto] Credential '{key}' not found in secrets/env")
         return val
 
     def _run_flow(self, flow_name: str) -> str:
