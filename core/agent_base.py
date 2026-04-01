@@ -1417,6 +1417,71 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
             self.logger.debug(f"Memory context load failed: {exc}")
             return ""
 
+    async def _maybe_compress_history_for_tools(self):
+        """CR-248: Proactive history compression to prevent tool-call degradation.
+
+        When the last N assistant responses were all text-only (no tool calls),
+        the LLM learns "in this conversation I only write text" and stops making
+        tool calls. This method compresses old history to break the pattern.
+
+        Triggers when consecutive_text_only responses exceed the configured
+        threshold (default: 8). Compresses by summarizing old messages into
+        a single summary message, keeping only the last 3 messages intact.
+        """
+        threshold = self.config.get("history_tool_hygiene_threshold", 0)  # Default off — benchmark shows qwen2.5/qwen3/mistral-small are reliable to 20+
+        if threshold <= 0 or len(self._history) < threshold:
+            return
+
+        # Count consecutive text-only assistant responses from the end
+        consecutive_text_only = 0
+        for entry in reversed(self._history):
+            if entry.get("role") == "assistant":
+                content = entry.get("content", "")
+                # Check if this response contained any tool-related content
+                has_tool_indicator = any(kw in content for kw in [
+                    "Tool '", "returned:", "tool_calls", "<tool_call>",
+                ])
+                if has_tool_indicator:
+                    break
+                consecutive_text_only += 1
+            elif entry.get("role") == "tool":
+                break  # A tool result means tools were recently used
+
+        if consecutive_text_only < threshold:
+            return
+
+        self.logger.info(
+            f"[{self.agent_name}] History hygiene: {consecutive_text_only} consecutive "
+            f"text-only responses (threshold={threshold}). Compressing history."
+        )
+
+        # Keep the last 4 messages (2 exchanges) intact
+        keep_recent = 4
+        if len(self._history) <= keep_recent + 2:
+            return
+
+        old_messages = self._history[:-keep_recent]
+        recent_messages = self._history[-keep_recent:]
+
+        # Build a summary of old messages
+        summary_parts = []
+        for entry in old_messages[-6:]:  # Summarize last 6 old messages
+            role = entry.get("role", "?")
+            content = entry.get("content", "")[:150]
+            summary_parts.append(f"[{role}]: {content}")
+        summary = "\n".join(summary_parts)
+
+        # Replace history with summary + recent messages
+        self._history = [
+            {"role": "user", "content": f"[Bisherige Konversation zusammengefasst]\n{summary}"},
+            {"role": "assistant", "content": "Verstanden, ich habe den Kontext. Ich nutze meine Tools wenn noetig."},
+        ] + recent_messages
+
+        self.logger.info(
+            f"[{self.agent_name}] History compressed: {len(old_messages) + len(recent_messages)} → "
+            f"{len(self._history)} messages"
+        )
+
     async def think(self, user_message: str) -> str:
         """Full loop: user msg → LLM → tool calls → clean → answer.
 
@@ -1424,6 +1489,10 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
         parsing if the model doesn't return structured tool_calls.
         """
         self._touch()
+
+        # CR-248: Proactive history compression to keep tool-calling reliable
+        await self._maybe_compress_history_for_tools()
+
         await self._persist_message("user", user_message)
 
         tool_block = self._build_tool_block()
@@ -1444,9 +1513,13 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
             project_block = get_project_context(self.agent_name)
         except Exception:
             pass
-        # Build system prompt: Core → User prompt → Memory → Calendar → Projects → Active Chats → Tools
+        # Build system prompt: Core → User prompt → Memory → Calendar → Projects → Active Chats
         system = self._CORE_SYSTEM_PROMPT + self._system_prompt + memory_block + calendar_block + project_block + chats_block
-        if tool_block:
+        # CR-248: Do NOT inject text-based tool_block when native tool-calling is active.
+        # The text block ("Available tools: write_file, send_email, ...") causes the LLM
+        # to write TEXT about tools instead of making native API tool calls.
+        # Only inject if no native tools are available (fallback for models without tool support).
+        if tool_block and not ollama_tools:
             system += "\n\n" + tool_block
 
         # CR-115: Filter history to current conversation thread (Telegram/internal/scheduled)
