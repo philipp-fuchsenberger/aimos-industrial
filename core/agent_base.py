@@ -224,7 +224,7 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
 
         # CR-138: Startup with 60s total timeout — prevents infinite hang on DB issues
         try:
-            await asyncio.wait_for(self._startup_sequence(), timeout=60)
+            await asyncio.wait_for(self._startup_sequence(), timeout=120)
         except asyncio.TimeoutError:
             self.logger.error(f"[{self.agent_name}] Startup timed out after 60s — aborting")
             await self.stop()
@@ -942,13 +942,37 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
                 args = {}
             return [{"name": m.group(1), "arguments": args}]
 
-        # Strategy 3: Python-style — tool_name(key=val, ...)
+        # Strategy 3: Python-style — tool_name(key=val, ...) or tool_name("pos1", "pos2")
         for name in self._tools:
-            pat = re.compile(rf"\b{re.escape(name)}\s*\(([^)]*)\)", re.IGNORECASE)
+            # Match tool_name( ... ) including multiline content in quotes
+            pat = re.compile(
+                rf'\b{re.escape(name)}\s*\((.+?)\)\s*$',
+                re.IGNORECASE | re.DOTALL | re.MULTILINE,
+            )
             pm = pat.search(text)
             if pm:
                 raw_args = pm.group(1).strip()
-                return [{"name": name, "arguments": self._parse_kwargs(raw_args) if raw_args else {}}]
+                # Try keyword args first (key=val)
+                kwargs = self._parse_kwargs(raw_args)
+                if kwargs:
+                    return [{"name": name, "arguments": kwargs}]
+                # Fallback: positional args — extract quoted strings
+                quoted = re.findall(r'(?:"((?:[^"\\]|\\.)*)"|\'((?:[^\'\\]|\\.)*)\')', raw_args)
+                if quoted and name == "write_file" and len(quoted) >= 2:
+                    filename = quoted[0][0] or quoted[0][1]
+                    content = quoted[1][0] or quoted[1][1]
+                    return [{"name": name, "arguments": {"filename": filename, "content": content}}]
+                elif quoted and len(quoted) >= 1:
+                    # Generic: first quoted arg as the main parameter
+                    return [{"name": name, "arguments": {"key": quoted[0][0] or quoted[0][1]}}]
+
+        # Strategy 3b: Multiple write_file calls in code blocks
+        if "write_file(" in text:
+            multi_calls = []
+            for m in re.finditer(r'write_file\s*\(\s*["\']([^"\']+)["\']\s*,\s*["\'](.+?)["\']\s*\)', text, re.DOTALL):
+                multi_calls.append({"name": "write_file", "arguments": {"filename": m.group(1), "content": m.group(2)}})
+            if multi_calls:
+                return multi_calls
 
         # Strategy 4: bare name — (tool_name) or tool_name()
         for name in self._tools:
@@ -1359,6 +1383,25 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
             mem_limit = _CB_MEMORY_LIMITS.get(cb, 50)
             top = scored[:mem_limit]
 
+            # BF-17: Memory hygiene — prune low-scoring memories if table grows too large
+            max_memories = self.config.get("max_memories", 200)
+            if len(rows) > max_memories:
+                # Delete lowest-scored memories beyond the limit
+                keep_keys = {item[2] for item in scored[:max_memories]}
+                prune_keys = [r[0] for r in rows if r[0] not in keep_keys]
+                if prune_keys:
+                    try:
+                        conn2 = sqlite3.connect(str(self._memory_db_path), timeout=3)
+                        conn2.executemany("DELETE FROM memories WHERE key=?", [(k,) for k in prune_keys[:50]])
+                        conn2.commit()
+                        conn2.close()
+                        self.logger.info(
+                            f"[{self.agent_name}] Memory hygiene: pruned {len(prune_keys[:50])} "
+                            f"low-scoring memories ({len(rows)} → ~{max_memories})"
+                        )
+                    except Exception:
+                        pass
+
             lines = []
             for score, cat, key, value, imp in top:
                 lines.append(f"- [{cat}] {key}: {value}")
@@ -1593,6 +1636,37 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
                 return
 
     # ══════════════════════════════════════════════════════════════════════════
+    #  CR-233: Batch Mode Helpers
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def format_batch_input(self, messages: list[dict]) -> str:
+        """Format all pending messages into a structured block for batch processing.
+
+        Returns a single string with sender info, timestamps, and channels
+        clearly delineated so the LLM can parse and group them.
+        """
+        parts = [f"=== BATCH INPUT: {len(messages)} pending message(s) ===\n"]
+        for i, msg in enumerate(messages, 1):
+            sender_id = msg.get("sender_id", 0)
+            kind = msg.get("kind", "text")
+            content = msg.get("content", "")
+            thread_id = msg.get("thread_id", "")
+            ts = msg.get("created_at")
+            if ts and hasattr(ts, "strftime"):
+                ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                ts_str = str(ts)[:19] if ts else "unknown"
+
+            parts.append(
+                f"--- Message {i}/{len(messages)} ---\n"
+                f"Sender: {sender_id} | Channel: {kind} | Time: {ts_str}"
+                f"{f' | Thread: {thread_id}' if thread_id else ''}\n"
+                f"{content}\n"
+            )
+        parts.append("=== END BATCH INPUT ===")
+        return "\n".join(parts)
+
+    # ══════════════════════════════════════════════════════════════════════════
     #  Main Loop
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -1618,7 +1692,10 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
             return []
         if rows:
             # CR-206b: Wait briefly for more messages (natural chat = burst of voice + photo + text)
-            await asyncio.sleep(3)
+            # Configurable per agent: voice=0, reactive=3 (default), batch=0 (collects all anyway)
+            burst_wait = self.config.get("burst_wait", 0 if self.config.get("execution_strategy") == "batch" else 3)
+            if burst_wait > 0:
+                await asyncio.sleep(burst_wait)
             try:
                 async with self._pool.acquire(timeout=5) as conn2:
                     late_rows = await conn2.fetch(
@@ -1635,6 +1712,20 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
                     self.logger.info(f"[{self.agent_name}] poll_pending: claimed {len(rows)} message(s)")
             except Exception:
                 self.logger.info(f"[{self.agent_name}] poll_pending: claimed {len(rows)} message(s)")
+        # H-07: Deduplicate messages with identical content + sender (IMAP retries, double delivery)
+        if rows:
+            seen = set()
+            deduped = []
+            for r in rows:
+                dedup_key = f"{r.get('sender_id', 0)}:{r.get('content', '')[:200]}"
+                if dedup_key not in seen:
+                    seen.add(dedup_key)
+                    deduped.append(r)
+                else:
+                    self.logger.info(f"[{self.agent_name}] Dedup: skipping duplicate msg id={r.get('id')}")
+            if len(deduped) < len(rows):
+                self.logger.info(f"[{self.agent_name}] Dedup: {len(rows)} → {len(deduped)} messages")
+            rows = deduped
         return [dict(r) for r in rows]
 
     async def run_loop(self, poll_interval: float | None = None):

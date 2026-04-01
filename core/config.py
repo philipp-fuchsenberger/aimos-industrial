@@ -34,7 +34,7 @@ class Config:
     """Immutable-ish config object — all values resolved once at import time."""
 
     # ── Database (asyncpg) ────────────────────────────────────────────────
-    PG_HOST: str = os.getenv("PG_HOST", "127.0.0.1")
+    PG_HOST: str = os.getenv("PG_HOST", "172.28.0.2")
     PG_PORT: int = int(os.getenv("PG_PORT", "5432"))
     PG_DB: str = os.getenv("PG_DB", "aimos")
     PG_USER: str = os.getenv("PG_USER", "n8n_user")
@@ -71,6 +71,7 @@ class Config:
             "database": cls.PG_DB,
             "user": cls.PG_USER,
             "password": cls.PG_PASSWORD,
+            "ssl": False,  # Local Docker PostgreSQL, no SSL needed
         }
 
     @classmethod
