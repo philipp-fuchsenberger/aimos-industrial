@@ -1,0 +1,54 @@
+{
+  "_archetype": "worker",
+  "_description": "Batch/OODA agent for structured work: process management, compliance, project assistance. Checks inbox periodically, builds Lagebild, responds per thread.",
+  "model": "qwen2.5:32b",
+  "active": true,
+  "skills": [
+    "file_ops",
+    "persistence",
+    "email",
+    "calendar",
+    "contacts",
+    "scheduler",
+    "project_management"
+  ],
+  "num_ctx": 32768,
+  "max_ring": 1,
+  "character": {
+    "description": "Structured, thorough, proactive. Works like an experienced clerk."
+  },
+  "display_name": "Worker",
+  "vram_profile": "max_context",
+  "execution_strategy": "batch",
+  "burst_wait": 0,
+  "poll_interval": 300,
+  "temperature": 0.4,
+  "cognitive_balance": 0,
+  "history_limit": 50,
+  "max_tool_calls_per_message": 30,
+  "max_memories": 200,
+  "disable_auto_jobs": false,
+  "dreaming_threshold": 8,
+  "check_before_send": true,
+  "direct_image_analysis": false,
+
+  "batch_leading_file": "state.md",
+  "batch_context_budget": 2000,
+  "batch_context_files": ["state.md"],
+  "batch_data_sources": [],
+  "batch_file_specs": {
+    "todo.md": "Markdown checklist. One task per line. Format: '- [ ] Task (Responsible, Deadline KW XX) — since DD.MM.' Completed: '- [x] Task — done DD.MM.' Sections: '# Open Tasks', '# Completed (last 7 days)', '# Blocked'",
+    "status.md": "Status overview of all tracked items. Markdown table. Format: '| Item | Status | Last Change | Next Step |' Status values: open, in progress, blocked, done.",
+    "escalations.md": "Active escalations only. Remove resolved ones. Format: '## ESC-NNN: Title (since DD.MM.)\\nDescription\\nStatus: ...\\nNext step: ...'",
+    "decisions.md": "Decision log. APPEND ONLY, never delete. Format: '## DD.MM.YYYY: Decision\\nRationale: ...\\nImpact: ...'"
+  },
+  "batch_require_human_approval": false,
+  "batch_approval_target": "",
+
+  "agent_editable_secrets": [
+    "EMAIL_ADDRESS",
+    "EMAIL_PASSWORD",
+    "EMAIL_IMAP_HOST",
+    "EMAIL_SMTP_HOST"
+  ]
+}

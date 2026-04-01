@@ -1,0 +1,37 @@
+{
+  "_archetype": "chat_assistant",
+  "_description": "Reactive chat agent for customer support, helpdesk, order intake. Responds per message with memory and delegation.",
+  "model": "qwen2.5:32b",
+  "active": true,
+  "skills": [
+    "file_ops",
+    "persistence",
+    "email",
+    "calendar",
+    "contacts",
+    "scheduler"
+  ],
+  "num_ctx": 16384,
+  "max_ring": 1,
+  "character": {
+    "description": "Professional, helpful, thorough. Formal address in German (Sie)."
+  },
+  "display_name": "Chat Assistant",
+  "vram_profile": "max_context",
+  "execution_strategy": "reactive",
+  "burst_wait": 3,
+  "temperature": 0.5,
+  "cognitive_balance": 0,
+  "history_limit": 30,
+  "max_tool_calls_per_message": 10,
+  "disable_auto_jobs": false,
+  "dreaming_threshold": 8,
+  "check_before_send": true,
+  "direct_image_analysis": true,
+  "agent_editable_secrets": [
+    "EMAIL_ADDRESS",
+    "EMAIL_PASSWORD",
+    "EMAIL_IMAP_HOST",
+    "EMAIL_SMTP_HOST"
+  ]
+}
