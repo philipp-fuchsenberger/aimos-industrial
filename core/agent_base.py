@@ -765,8 +765,8 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
         self.logger.debug(f"Tool registered: {name}")
 
     def _build_tool_block(self) -> str:
-        """Legacy: text-based tool block for system prompt. Still used as documentation
-        for the LLM, but actual tool-calling is done via Ollama's native API."""
+        """Text-based tool block for system prompt. Fallback for models without
+        native tool-calling support (e.g. deepseek-r1, gemma2)."""
         if not self._tools:
             return ""
         lines = ["Available tools (called via function calling):"]
@@ -1515,10 +1515,8 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
             pass
         # Build system prompt: Core → User prompt → Memory → Calendar → Projects → Active Chats
         system = self._CORE_SYSTEM_PROMPT + self._system_prompt + memory_block + calendar_block + project_block + chats_block
-        # CR-248: Do NOT inject text-based tool_block when native tool-calling is active.
-        # The text block ("Available tools: write_file, send_email, ...") causes the LLM
-        # to write TEXT about tools instead of making native API tool calls.
-        # Only inject if no native tools are available (fallback for models without tool support).
+        # Text-based tool block is only for models without native tool-calling (deepseek, gemma).
+        # Models with native support (qwen, mistral) get tool definitions via the API.
         if tool_block and not ollama_tools:
             system += "\n\n" + tool_block
 
