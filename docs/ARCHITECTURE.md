@@ -262,6 +262,30 @@ Root cause of recurring agent hangs: asyncpg pool had no `command_timeout`. Any 
 | `_persist_message()` | 10s | Chat history write → skip on timeout |
 | CR-120 zombie detection | — | Safety net: kills stuck processes |
 | CR-137 process watchdog | 5min | Safety net: kills 0% CPU + stale heartbeat |
+| CR-270 batch hard timeout | 600s | Per-think() wall-clock limit in batch mode |
+| CR-270 API failure tracking | 5×15s | 5 consecutive /api/ps failures → cancel think() |
+| CR-270 OS-level watchdog | 180s | systemd timer checks /tmp/aimos_heartbeat, kills+restarts on stale |
+
+## OS-Level Freeze Protection (CR-270)
+
+Last-resort safety net against total system freezes (VRAM OOM, kernel stall).
+All application-level watchdogs share the asyncio event loop — if it freezes,
+they freeze too. The OS-level watchdog runs **outside** the Python process:
+
+```
+Dashboard (Python)                     systemd (OS)
+  │                                      │
+  ├─ Heartbeat Thread (daemon)           ├─ aimos-watchdog.timer (60s)
+  │   └─ writes /tmp/aimos_heartbeat     │   └─ runs system_watchdog.sh
+  │      every 10s                       │       ├─ checks heartbeat age
+  │                                      │       ├─ if >180s: kill -9 all AIMOS
+  │  [Event Loop freezes]                │       ├─ flush Ollama VRAM
+  │  [Thread stops writing]              │       ├─ reset DB statuses
+  │                                      │       └─ restart Dashboard
+  └─ (dead)                              └─ (always alive via systemd)
+```
+
+Install: `sudo systemctl enable --now aimos-watchdog.timer`
 
 ## Execution Rings — Agent Trust Levels (CR-142)
 
@@ -351,3 +375,43 @@ AIMOS uses thread-based isolation to support multiple concurrent conversations p
 |---|---|---|
 | `AIMOS_DASHBOARD_PASSWORD` | `aimos2026` | HTTP Basic Auth password for dashboard |
 | `AIMOS_CORS_ORIGIN` | `*` | Allowed CORS origin (CR-162/CR-175). Set to specific origin in production, e.g. `https://aimos.local` |
+
+---
+
+## Tool-Phase Registry — OODA Compliance
+
+Jedes Tool hat eine Phase-Zuordnung die definiert, WANN es im OODA-Zyklus aufgerufen werden darf.
+Maschinenlesbare Quelle: `core/tool_phase_registry.py` (102 Tools registriert).
+
+### Kategorien
+
+| Code | Kategorie | Erlaubte Phasen | Begründung |
+|------|-----------|----------------|-----------|
+| **R** | READ (17 Tools) | 0, 1, 2, 2b, 3c | Informationen beschaffen — Voraussetzung für Entscheidungen |
+| **D** | DATA (38 Tools) | 0, 2, 3c | Externe Quellen (DB, API, Email, Dropbox) nur zum Lesen — nie beim Antworten |
+| **W** | WRITE (26 Tools) | 3c (auto), 4 | Ergebnisse sichern NUR nach abgeschlossener Analyse. DB schreiben in 3/4. |
+| **C** | COMMUNICATE (7 Tools) | 3 | Nachrichten an Menschen NUR in ACT — NACHDEM Dokumente gelesen sind |
+| **S** | SCHEDULE (8 Tools) | 4 | Erinnerungen/Termine NUR in PERSIST — nicht mitten in der Analyse |
+| **E** | EXTERNAL (6 Tools) | 2, 3, 4 | Spezialsysteme (ELSTER, Vision-API) — phasenabhängig |
+
+### Verbotene Kombinationen
+
+| Regel | Warum |
+|-------|-------|
+| COMMUNICATE in Phase 0/1/2/3c | Agent darf nicht antworten bevor er alle Dokumente gelesen hat |
+| WRITE in Phase 0/1/2 | Keine Seiteneffekte während der Analyse |
+| Datenbank SCHREIBEN in Phase 0/1/2 | Lesen ja, Schreiben nur als Aktion (Phase 3) oder Persist (Phase 4) |
+| web_search in Phase 3 | Recherche gehört in die Analysephase, nicht beim Antworten |
+| ELSTER submit ohne Mandant-OK | Einreichung nur nach expliziter Bestätigung |
+
+### Neue Tools hinzufügen
+
+Jedes neue Tool MUSS in `core/tool_phase_registry.py` registriert werden:
+
+```python
+TOOL_REGISTRY["mein_neues_tool"] = ("D", {P0, P2}, "Beschreibung was es tut")
+#                                    ↑      ↑
+#                                 Kategorie  Erlaubte Phasen
+```
+
+`check_agent_compliance(config)` prüft bei Deployment ob die Agent-Config konsistent ist.
