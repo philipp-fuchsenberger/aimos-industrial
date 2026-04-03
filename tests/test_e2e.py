@@ -42,7 +42,7 @@ PROCESS_TIMEOUT = 120  # seconds to wait for agent processing
 # ---------------------------------------------------------------------------
 
 def _unique_thread_id(prefix: str = "pytest") -> str:
-    h = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
+    h = hashlib.md5(str(time.time()).encode(), usedforsecurity=False).hexdigest()[:8]
     return f"email:{prefix}@test.local:{h}"
 
 
@@ -113,7 +113,7 @@ def _build_email_content(from_addr: str, subject: str, body: str) -> str:
         f"Betreff: {subject}\n"
         f"Datum: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"Text: {body}\n"
-        f"Message-ID: <pytest-{hashlib.md5(str(time.time()).encode()).hexdigest()[:12]}@test>"
+        f"Message-ID: <pytest-{hashlib.md5(str(time.time()).encode(), usedforsecurity=False).hexdigest()[:12]}@test>"
     )
 
 

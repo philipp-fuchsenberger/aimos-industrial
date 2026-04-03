@@ -74,7 +74,7 @@ def _sanitize_filename(raw_name: str, fallback_prefix: str = "file") -> str:
     - Returns a safe fallback if nothing usable remains
     """
     if not raw_name:
-        return f"{fallback_prefix}_{hashlib.md5(str(time.time()).encode()).hexdigest()[:8]}"
+        return f"{fallback_prefix}_{hashlib.md5(str(time.time()).encode(), usedforsecurity=False).hexdigest()[:8]}"
 
     # Strip path components — only keep the filename
     name = os.path.basename(raw_name)
@@ -109,7 +109,7 @@ def _sanitize_filename(raw_name: str, fallback_prefix: str = "file") -> str:
 
     # Final fallback
     if not name or name == ".blocked":
-        name = f"{fallback_prefix}_{hashlib.md5(raw_name.encode()).hexdigest()[:8]}"
+        name = f"{fallback_prefix}_{hashlib.md5(raw_name.encode(), usedforsecurity=False).hexdigest()[:8]}"
 
     return name
 
@@ -184,7 +184,7 @@ def _is_duplicate(agent_name: str, sender_id: int, content: str) -> bool:
     for k in stale:
         del _recent_hashes[k]
     # Check
-    h = hashlib.md5(f"{agent_name}:{sender_id}:{content}".encode()).hexdigest()
+    h = hashlib.md5(f"{agent_name}:{sender_id}:{content}".encode(), usedforsecurity=False).hexdigest()
     if h in _recent_hashes:
         return True
     _recent_hashes[h] = now
@@ -1411,7 +1411,7 @@ async def _run_imap_poller(agents_with_email: list[dict], shutdown: asyncio.Even
                         mail.get("subject", ""), flags=_re.IGNORECASE
                     ).strip().lower()
                     _from_addr = mail.get("from", "").strip()
-                    subject_hash = hashlib.md5(normalized_subj.encode()).hexdigest()[:8]
+                    subject_hash = hashlib.md5(normalized_subj.encode(), usedforsecurity=False).hexdigest()[:8]
                     _subject_thread_id = f"email:{_from_addr}:{subject_hash}"
 
                     if mail.get("in_reply_to") or mail.get("references"):
