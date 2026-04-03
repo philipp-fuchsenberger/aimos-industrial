@@ -5,14 +5,14 @@ Sicherheit:
   - IMAP: Port 993, SSL/TLS, mindestens TLS 1.2
   - SMTP: Port 587 STARTTLS (primaer), Port 465 implicit SSL (Fallback)
   - TLS < 1.2 explizit verboten (OP_NO_TLSv1 | OP_NO_TLSv1_1)
-  - FROM-Adresse = EMAIL_ADDRESS (verhindert Provider-Ablehnungen)
+  - FROM-Adresse = EMAIL_ADDRESS (verhindert GMX-Ablehnungen)
 
 Credentials (in env_secrets):
   EMAIL_ADDRESS     – E-Mail-Adresse (= Login UND Absender)
   EMAIL_PASSWORD    – Passwort / App-Passwort
-  EMAIL_IMAP_HOST   – IMAP-Server (default: imap.example.com)
+  EMAIL_IMAP_HOST   – IMAP-Server (default: imap.gmx.net)
   EMAIL_IMAP_PORT   – IMAP-Port (default: 993)
-  EMAIL_SMTP_HOST   – SMTP-Server (default: smtp.example.com)
+  EMAIL_SMTP_HOST   – SMTP-Server (default: mail.gmx.net)
   EMAIL_SMTP_PORT   – SMTP-Port (default: 587, Fallback: 465)
 
 Aktivierung:
@@ -65,12 +65,12 @@ class EmailSkill(BaseSkill):
             {"key": "EMAIL_PASSWORD", "label": "Email Password", "type": "password",
              "placeholder": "", "hint": "App password recommended", "secret": True},
             {"key": "EMAIL_IMAP_HOST", "label": "IMAP Host", "type": "text",
-             "placeholder": "imap.example.com", "hint": "IMAP server (SSL, port 993)", "secret": True},
+             "placeholder": "imap.gmx.net", "hint": "IMAP server (SSL, port 993)", "secret": True},
             {"key": "EMAIL_SMTP_HOST", "label": "SMTP Host", "type": "text",
-             "placeholder": "smtp.example.com", "hint": "SMTP server (STARTTLS, port 587)", "secret": True},
+             "placeholder": "mail.gmx.net", "hint": "SMTP server (STARTTLS, port 587)", "secret": True},
         ]
 
-    def __init__(self, agent_name: str = "", config: dict = None,
+    def __init__(self, agent_name: str = "", config: dict | None = None,
                  secrets: dict[str, str] | None = None, **kwargs) -> None:
         self._init_secrets(secrets)
         self._agent_name = agent_name
@@ -319,8 +319,23 @@ class EmailSkill(BaseSkill):
 
         Primaer: Port 587 + STARTTLS.
         Fallback: Port 465 + implicit SSL.
-        FROM-Header = EMAIL_ADDRESS (many providers require Uebereinstimmung).
+        FROM-Header = EMAIL_ADDRESS (GMX erfordert Uebereinstimmung).
         """
+        # CR-273: LLM sometimes double-quotes the body ("\"text\"")
+        # Strip leading/trailing literal quotes that survived JSON parsing
+        body = body.strip()
+        if body.startswith('"') and body.endswith('"') and len(body) > 2:
+            body = body[1:-1]
+        elif body.startswith('"'):
+            body = body[1:]
+        # Also unescape common JSON artifacts in body text
+        body = body.replace('\\n', '\n').replace('\\"', '"')
+
+        # Reject suspiciously short bodies (truncated by JSON parse error)
+        if len(body.strip()) < 20:
+            logger.warning(f"send_email: body too short ({len(body)} chars), likely truncated")
+            return {"error": f"Email body too short ({len(body)} chars) — likely a parsing error. Please regenerate the email text."}
+
         ok, msg_text = self._credentials_complete()
         if not ok:
             return {"error": msg_text}
@@ -330,7 +345,7 @@ class EmailSkill(BaseSkill):
         smtp_host = self._secret("EMAIL_SMTP_HOST")
         smtp_port = int(self._secret("EMAIL_SMTP_PORT", "587"))
 
-        # Build message — FROM must match EMAIL_ADDRESS exactly (SMTP policy)
+        # Build message — FROM must match EMAIL_ADDRESS exactly (GMX policy)
         msg = email.mime.multipart.MIMEMultipart()
         msg["From"] = addr
         msg["To"] = to
@@ -357,7 +372,7 @@ class EmailSkill(BaseSkill):
         recipients = [r.strip() for r in to.split(",")]
         err_587 = None
 
-        # Attempt 1: Port 587 + STARTTLS (standard SMTP)
+        # Attempt 1: Port 587 + STARTTLS (standard for GMX)
         try:
             return self._send_starttls(smtp_host, smtp_port, addr, passwd, recipients, msg, tls_ctx)
         except Exception as exc:

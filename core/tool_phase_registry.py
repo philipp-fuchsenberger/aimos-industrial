@@ -1,250 +1,359 @@
 """
-AIMOS Tool-Phase Registry — Definiert welche Tools in welcher OODA-Phase erlaubt sind.
-======================================================================================
+AIMOS Tool-Phase Registry — OODA Compliance
+=============================================
 
-Jedes Tool MUSS hier registriert sein. Neue Tools ohne Registrierung werden
-beim Agent-Start mit WARNING geloggt und in Phase 3 (ACT) blockiert.
+Definiert welche Tools in welcher OODA-Phase dem LLM zur Verfügung stehen.
+Nicht registrierte Tools werden mit WARNING geloggt.
 
-Phasen:
-  0  = KONTEXT (Workspace laden, Datenquellen prüfen)
-  1  = OBSERVE (Inputs strukturieren)
-  2  = ORIENT  (Lagebild bauen, Recherche)
-  2b = DECIDE  (Stakeholder/Verarbeitungsplan)
-  3c = ANALYSE (Dokumente lesen, Chunks verarbeiten)
-  3  = ACT     (Stakeholder antworten, Emails senden)
-  3b = VALIDATE (Antworten prüfen)
-  4  = PERSIST (Workspace schreiben, Erinnerungen)
+OODA-Phasen (6 Phasen):
+  0 = KONTEXT   — Workspace laden, Datenquellen synchronisieren
+  1 = OBSERVE   — Inputs strukturieren, Inventory erstellen
+  2 = ORIENT    — Lagebild bauen: Recherche + Dokument-Analyse (Loop!)
+                   2a: Chunk-Loop (N LLM-Calls, je 1 pro Dokument-Chunk)
+                   2b: Lagebild konsolidieren (1 LLM-Call)
+                   ⚠ Sicherung: max_chunks_per_cycle + Hard-Timeout
+  3 = DECIDE    — Stakeholder identifizieren, Verarbeitungsplan
+  4 = ACT       — Outbound Dispatch (kann fehlschlagen, kann übersprungen werden)
+                   4a: Draft generieren (LLM, KEINE Send-Tools)
+                   4b: Validate (LLM, prüft Draft)
+                   4c: Dispatch (ORCHESTRATOR, kein LLM)
+                   Alles was nach AUSSEN geht: Email, Teams, JIRA, CB, ELSTER...
+  5 = PERSIST   — Guaranteed Self-Dispatch (MUSS IMMER laufen, auch bei ACT-Crash)
+                   Konzeptionell "Dispatch an sich selbst".
+                   Schützt vor Amnesie. Läuft im finally-Block.
+                   Config: batch_persist=false → überspringen (stateless Agent)
 
-Kategorien:
-  R = READ     — Informationen beschaffen (lokal)
-  D = DATA     — Externe Datenquellen abfragen
-  W = WRITE    — Informationen persistieren
-  C = COMMUNICATE — Nachrichten an Menschen senden
-  S = SCHEDULE — Zeitgesteuerte Aktionen
-  E = EXTERNAL — Spezialisierte externe Systeme
+Architektur-Prinzip:
+  Das LLM DENKT und SCHREIBT Drafts + generiert Dokumente.
+  Der Orchestrator DISPATCHT nach außen (Email, Teams, JIRA, ELSTER...).
+  PERSIST ist "Self-Dispatch" — gleiche Mechanik, aber guaranteed.
+
+  Dispatch-Ziele:
+    Outbound (Phase 4): Email, Teams, Telegram, JIRA, CB, AzDO, ELSTER, SharePoint
+    Self (Phase 5):     Workspace (state.md), Gedächtnis (remember), Termine (set_reminder)
+
+Kategorien (nur LLM-seitige Tools):
+  R = READ     — Informationen beschaffen (lokal + Gedächtnis)
+  D = DATA     — Externe Datenquellen abfragen (nur lesen!)
+  W = WRITE    — Workspace-Dateien schreiben, Gedächtnis aktualisieren
+  S = SCHEDULE — Erinnerungen, Termine, Aufgaben erstellen
+  E = EXTERNAL — Spezialisierte externe Systeme (ELSTER, Vision-API)
+
+Nicht mehr als LLM-Tool:
+  C = COMMUNICATE — wird vom Orchestrator ausgeführt, nicht vom LLM
 """
 
 import logging
+from typing import Optional
 
 log = logging.getLogger("AIMOS.ToolPhaseRegistry")
 
-# Phase codes
-P0 = "0"       # KONTEXT
-P1 = "1"       # OBSERVE
-P2 = "2"       # ORIENT
-P2b = "2b"     # DECIDE
-P3c = "3c"     # ANALYSE (Dokumente)
-P3 = "3"       # ACT (Stakeholder)
-P3b = "3b"     # VALIDATE
-P4 = "4"       # PERSIST
+# ── Phase Constants ───────────────────────────────────────────────────────────
 
-ALL_PHASES = {P0, P1, P2, P2b, P3c, P3, P3b, P4}
-READ_PHASES = {P0, P1, P2, P2b, P3c}
-ACT_PHASES = {P3}
-WRITE_PHASES = {P3c, P4}  # 3c = auto-persist only
-PERSIST_PHASES = {P4}
+P_KONTEXT  = "0"
+P_OBSERVE  = "1"
+P_ORIENT   = "2"   # Includes 2a (chunk-loop) + 2b (consolidation)
+P_DECIDE   = "3"
+P_ACT      = "4"   # Includes 4a (draft) + 4b (validate) + 4c (dispatch by orchestrator)
+P_PERSIST  = "5"     # Guaranteed self-dispatch — ALWAYS runs, even if ACT fails
+
+ALL_PHASES = {P_KONTEXT, P_OBSERVE, P_ORIENT, P_DECIDE, P_ACT, P_PERSIST}
+
+PHASE_NAMES = {
+    P_KONTEXT:  "KONTEXT",
+    P_OBSERVE:  "OBSERVE",
+    P_ORIENT:   "ORIENT",
+    P_DECIDE:   "DECIDE",
+    P_ACT:      "ACT",
+    P_PERSIST:  "PERSIST",
+}
+
+# Sub-phases (for tool filtering within a phase)
+P_ORIENT_CHUNK = "2a"   # Chunk-Loop innerhalb ORIENT
+P_ORIENT_CONSOL = "2b"  # Lagebild-Konsolidierung
+P_ACT_DRAFT = "4a"      # Draft generieren
+P_ACT_VALIDATE = "4b"   # Draft prüfen
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  REGISTRY: tool_name → (category, allowed_phases, description)
 # ══════════════════════════════════════════════════════════════════════════════
 
 TOOL_REGISTRY: dict[str, tuple[str, set[str], str]] = {
-    # ── R: READ (local workspace) ────────────────────────────────────────
-    "read_file":          ("R", {P0, P1, P2, P3c, P4},    "Workspace-Datei lesen"),
-    "read_file_chunked":  ("R", {P0, P3c},                 "Große Datei seitenweise"),
-    "list_workspace":     ("R", {P0, P1},                   "Dateien auflisten"),
-    "read_public":        ("R", {P0, P2},                   "Öffentliche Datei (Norm, KB)"),
-    "search_in_file":     ("R", {P0, P2, P3c},             "In Datei suchen"),
-    "get_file_overview":  ("R", {P0, P1},                   "Datei-Übersicht"),
-    "current_time":       ("R", ALL_PHASES,                  "Aktuelle Uhrzeit"),
-    "system_status":      ("R", {P0},                        "System/GPU Status"),
 
-    # ── R: READ (memory) ─────────────────────────────────────────────────
-    "recall":             ("R", {P0, P2, P3},               "Langzeitgedächtnis abfragen"),
-    "lookup_thread":      ("R", {P0, P2, P3},               "Thread-History nachschlagen"),
-    "find_contact":       ("R", {P0, P2, P3},               "Kontakt suchen"),
-    "list_contacts":      ("R", {P0, P2},                    "Alle Kontakte"),
+    # ══════════════════════════════════════════════════════════════════════
+    # R: READ — Informationen beschaffen
+    # Begründung: Lesen ist Voraussetzung für Analyse. Nur in Gather-Phasen,
+    # plus recall/contacts in ACT (Agent braucht Wissen beim Antwort-Drafting).
+    # ══════════════════════════════════════════════════════════════════════
 
-    # ── R: READ (OCR) ───────────────────────────────────────────────────
-    "ocr_extract_text":   ("R", {P3c},                      "PDF/Bild → Text"),
-    "ocr_extract_fields": ("R", {P3c},                      "Strukturierte Daten aus Dokument"),
-    "ocr_list_scannable": ("R", {P0, P1},                   "Scanbare Dateien auflisten"),
+    "read_file":          ("R", {P_KONTEXT, P_OBSERVE, P_ORIENT, P_ACT, P_PERSIST},
+                           "Workspace-Datei lesen"),
+    "read_file_chunked":  ("R", {P_KONTEXT, P_ORIENT},
+                           "Große Datei seitenweise — Kontext + Analyse"),
+    "list_workspace":     ("R", {P_KONTEXT, P_OBSERVE},
+                           "Dateien auflisten — Inventar"),
+    "read_public":        ("R", {P_KONTEXT, P_ORIENT},
+                           "Öffentliche Datei (Norm, KB) — Lagebild"),
+    "search_in_file":     ("R", {P_KONTEXT, P_ORIENT},
+                           "In Datei suchen — Recherche"),
+    "get_file_overview":  ("R", {P_KONTEXT, P_OBSERVE},
+                           "Datei-Übersicht — Inventar"),
+    "current_time":       ("R", ALL_PHASES,
+                           "Uhrzeit — immer verfügbar"),
+    "system_status":      ("R", {P_KONTEXT},
+                           "GPU/System — nur beim Start"),
+    "recall":             ("R", {P_KONTEXT, P_ORIENT, P_ACT},
+                           "Langzeitgedächtnis — Kontext, Lagebild, Draft"),
+    "lookup_thread":      ("R", {P_KONTEXT, P_ORIENT, P_ACT},
+                           "Thread-History — für kontextbezogene Drafts"),
+    "find_contact":       ("R", {P_KONTEXT, P_ORIENT, P_ACT},
+                           "Kontakt suchen — für Adressierung in Drafts"),
+    "list_contacts":      ("R", {P_KONTEXT, P_ORIENT},
+                           "Alle Kontakte — Übersicht"),
+    "ocr_extract_text":   ("R", {P_ORIENT},
+                           "PDF/Bild → Text — Dokument-Analyse in ORIENT"),
+    "ocr_extract_fields": ("R", {P_ORIENT},
+                           "Strukturierte Daten — Dokument-Analyse"),
+    "ocr_list_scannable": ("R", {P_KONTEXT, P_OBSERVE},
+                           "Scanbare Dateien — Inventar"),
+    "report_daily_summary":  ("R", {P_ORIENT, P_PERSIST},
+                              "Tagesübersicht lesen"),
+    "report_weekly_overview": ("R", {P_ORIENT},
+                               "Wochenübersicht lesen"),
 
-    # ── D: DATA (externe Datenquellen lesen) ─────────────────────────────
-    "fetch_user_mail":    ("D", {P0},                        "IMAP-Postfach abrufen"),
-    "search_mail":        ("D", {P0, P2},                    "Im Mail-Archiv suchen"),
-    "read_mail":          ("D", {P0, P2, P3c},              "Einzelne Mail lesen"),
-    "web_search":         ("D", {P2, P3c},                   "Internet-Recherche"),
-    "web_browse":         ("D", {P2, P3c},                   "Webseite lesen"),
+    # ══════════════════════════════════════════════════════════════════════
+    # D: DATA — Externe Datenquellen (NUR LESEN)
+    # Begründung: Externe Quellen nur in KONTEXT (sync) und ORIENT (Recherche).
+    # In ACT wird nicht mehr recherchiert — das Lagebild ist fertig.
+    # ══════════════════════════════════════════════════════════════════════
 
-    # ── D: DATA (Dropbox) ───────────────────────────────────────────────
-    "dropbox_list_folder":    ("D", {P0},                    "Dropbox-Ordner auflisten"),
-    "dropbox_download_file":  ("D", {P0},                    "Datei aus Dropbox laden"),
-    "dropbox_sync_folder":    ("D", {P0},                    "Ordner synchronisieren"),
-    "dropbox_check_new_files":("D", {P0},                    "Neue Dateien prüfen"),
-    "dropbox_get_file_info":  ("D", {P0, P2},                "Datei-Info"),
+    # Email
+    "fetch_user_mail":    ("D", {P_KONTEXT},               "IMAP sync — nur beim Start"),
+    "search_mail":        ("D", {P_KONTEXT, P_ORIENT},     "Mail-Archiv — Kontext + Lagebild"),
+    "read_mail":          ("D", {P_KONTEXT, P_ORIENT},     "Mail lesen — Kontext + Analyse"),
+    # Web
+    "web_search":         ("D", {P_ORIENT},                "Internet-Recherche — nur Lagebild"),
+    "web_browse":         ("D", {P_ORIENT},                "Webseite lesen — nur Lagebild"),
+    # Dropbox
+    "dropbox_list_folder":    ("D", {P_KONTEXT},           "Dropbox auflisten"),
+    "dropbox_download_file":  ("D", {P_KONTEXT},           "Datei laden"),
+    "dropbox_sync_folder":    ("D", {P_KONTEXT},           "Ordner sync"),
+    "dropbox_check_new_files":("D", {P_KONTEXT},           "Neue Dateien"),
+    "dropbox_get_file_info":  ("D", {P_KONTEXT, P_ORIENT}, "Datei-Info"),
+    # Codebeamer
+    "cb_search_items":        ("D", {P_KONTEXT, P_ORIENT}, "Requirements suchen"),
+    "cb_get_item":            ("D", {P_ORIENT},            "Requirement lesen"),
+    "cb_get_item_relations":  ("D", {P_ORIENT},            "Traceability prüfen"),
+    "cb_get_baselines":       ("D", {P_KONTEXT, P_ORIENT}, "Baselines"),
+    "cb_compare_baselines":   ("D", {P_ORIENT},            "Baselines vergleichen"),
+    # JIRA
+    "jira_search_issues":     ("D", {P_KONTEXT, P_ORIENT}, "Issues suchen"),
+    "jira_get_issue":         ("D", {P_ORIENT},            "Issue lesen"),
+    # Azure DevOps
+    "azdo_search_work_items": ("D", {P_KONTEXT, P_ORIENT}, "Work Items suchen"),
+    "azdo_get_work_item":     ("D", {P_ORIENT},            "Work Item lesen"),
+    "azdo_list_pipelines":    ("D", {P_KONTEXT, P_ORIENT}, "Pipelines"),
+    # ERP
+    "get_customer_balance":   ("D", {P_ORIENT},            "Kundensaldo"),
+    "list_unpaid_invoices":   ("D", {P_ORIENT},            "Offene Rechnungen"),
+    "search_transactions":    ("D", {P_ORIENT},            "Buchungen suchen"),
+    "get_daily_summary":      ("D", {P_ORIENT},            "Tageszusammenfassung"),
+    # Confluence
+    "confluence_search":          ("D", {P_KONTEXT, P_ORIENT}, "Confluence suchen"),
+    "confluence_get_page":        ("D", {P_ORIENT},            "Seite lesen"),
+    "confluence_get_space_pages": ("D", {P_KONTEXT},           "Space-Seiten"),
+    # SharePoint
+    "sp_search_documents":    ("D", {P_KONTEXT, P_ORIENT}, "SharePoint suchen"),
+    "sp_get_document":        ("D", {P_ORIENT},            "Dokument-Metadaten"),
+    "sp_get_document_content":("D", {P_ORIENT},            "Dokumentinhalt"),
+    "sp_list_folder":         ("D", {P_KONTEXT},           "Ordner auflisten"),
+    "sp_list_sites":          ("D", {P_KONTEXT},           "Sites"),
+    # Calendar
+    "list_events":            ("D", {P_KONTEXT, P_ORIENT}, "Kalender"),
+    "check_today":            ("D", {P_KONTEXT},           "Heutige Termine"),
+    "check_overdue":          ("D", {P_KONTEXT},           "Überfällige"),
+    # Teams (LESEN)
+    "teams_get_messages":     ("D", {P_KONTEXT, P_ORIENT}, "Teams lesen"),
+    "teams_list_channels":    ("D", {P_KONTEXT},           "Kanäle"),
+    "teams_list_teams":       ("D", {P_KONTEXT},           "Teams"),
+    # Vision
+    "analyze_image":          ("D", {P_ORIENT},
+                               "Bild via externe Vision-API — wenn OCR versagt"),
 
-    # ── D: DATA (Codebeamer) ────────────────────────────────────────────
-    "cb_search_items":        ("D", {P0, P2},                "Requirements suchen"),
-    "cb_get_item":            ("D", {P2, P3c},               "Requirement lesen"),
-    "cb_get_item_relations":  ("D", {P2, P3c},               "Traceability prüfen"),
-    "cb_get_baselines":       ("D", {P0, P2},                "Baselines abrufen"),
-    "cb_compare_baselines":   ("D", {P2},                    "Baselines vergleichen"),
+    # ══════════════════════════════════════════════════════════════════════
+    # W: WRITE — Workspace + externe Systeme SCHREIBEN
+    # Begründung: Schreiben NUR in PERSIST (Phase 5).
+    # Ausnahme: store_chunk_summary in ORIENT (auto-persist der Chunk-Analyse).
+    # ══════════════════════════════════════════════════════════════════════
 
-    # ── D: DATA (JIRA) ──────────────────────────────────────────────────
-    "jira_search_issues":     ("D", {P0, P2},                "Issues suchen"),
-    "jira_get_issue":         ("D", {P2, P3c},               "Issue lesen"),
+    # Workspace — write_file auch in ACT erlaubt für Dokument-Generierung
+    # (z.B. Steuerberater erstellt Aufstellung als PDF-Anhang für Email)
+    "write_file":             ("W", {P_ACT, P_PERSIST},    "Workspace-Datei schreiben"),
+    "remember":               ("W", {P_PERSIST},           "Langzeitgedächtnis"),
+    "forget":                 ("W", {P_PERSIST},           "Fakt löschen"),
+    "update_customer":        ("W", {P_PERSIST},           "Kundendaten"),
+    "add_contact":            ("W", {P_PERSIST},           "Kontakt anlegen"),
+    "store_chunk_summary":    ("W", {P_ORIENT, P_PERSIST}, "Chunk-Ergebnis (auto-persist)"),
+    # Externe Systeme schreiben — ORCHESTRATOR DISPATCH (nicht im LLM-Tool-Set!)
+    # cb_create_item, jira_create_issue, azdo_create_work_item etc.
+    # sind in ORCHESTRATOR_DISPATCH_TOOLS → LLM drafted Inhalt, Orchestrator schreibt
+    # Office-Dokumente — auch in ACT (Agent erstellt Aufstellung/Report als Email-Anhang)
+    "create_word_document":     ("W", {P_ACT, P_PERSIST},  "Word — für Mandant/Stakeholder"),
+    "create_excel_sheet":       ("W", {P_ACT, P_PERSIST},  "Excel — Aufstellung/Übersicht"),
+    "create_pptx_presentation": ("W", {P_ACT, P_PERSIST},  "PowerPoint"),
+    "create_pdf":               ("W", {P_ACT, P_PERSIST},  "PDF — Zusammenfassung/Report"),
+    "convert_document":         ("W", {P_ACT, P_PERSIST},  "Konvertieren"),
+    # Reports
+    "html_report_create":           ("W", {P_ACT, P_PERSIST},  "HTML-Report — als Email-Anhang"),
+    "html_report_status_dashboard": ("W", {P_ACT, P_PERSIST},  "Dashboard"),
+    "html_report_with_chart":       ("W", {P_ACT, P_PERSIST},  "Report + Charts"),
 
-    # ── D: DATA (Azure DevOps) ──────────────────────────────────────────
-    "azdo_search_work_items": ("D", {P0, P2},                "Work Items suchen"),
-    "azdo_get_work_item":     ("D", {P2, P3c},               "Work Item lesen"),
-    "azdo_list_pipelines":    ("D", {P0, P2},                "Pipelines auflisten"),
+    # ══════════════════════════════════════════════════════════════════════
+    # S: SCHEDULE — Zeitgesteuerte Aktionen
+    # Begründung: Nur in PERSIST — man plant keine Termine mitten in der Analyse.
+    # ══════════════════════════════════════════════════════════════════════
 
-    # ── D: DATA (ERP/Buchhaltung) ───────────────────────────────────────
-    "get_customer_balance":   ("D", {P2},                    "Kundensaldo"),
-    "list_unpaid_invoices":   ("D", {P2},                    "Offene Rechnungen"),
-    "search_transactions":    ("D", {P2, P3c},               "Buchungen suchen"),
-    "get_daily_summary":      ("D", {P2},                    "Tageszusammenfassung"),
+    "set_reminder":           ("S", {P_PERSIST},           "Erinnerung"),
+    "add_event":              ("S", {P_PERSIST},           "Termin"),
+    "complete_event":         ("S", {P_PERSIST},           "Termin erledigt"),
+    "delete_event":           ("S", {P_PERSIST},           "Termin löschen"),
+    "list_jobs":              ("S", {P_KONTEXT, P_PERSIST},"Geplante Jobs"),
+    "add_task":               ("S", {P_PERSIST},           "Aufgabe"),
+    "update_task":            ("S", {P_PERSIST},           "Aufgabe aktualisieren"),
+    "complete_task":          ("S", {P_PERSIST},           "Aufgabe abschließen"),
 
-    # ── D: DATA (Confluence) ────────────────────────────────────────────
-    "confluence_search":      ("D", {P0, P2},                "Confluence durchsuchen"),
-    "confluence_get_page":    ("D", {P2, P3c},               "Seite lesen"),
-    "confluence_get_space_pages": ("D", {P0},                "Space-Seiten auflisten"),
+    # ══════════════════════════════════════════════════════════════════════
+    # E: EXTERNAL — Spezialisierte Systeme
+    # Begründung: Phase abhängig vom Zweck.
+    # ══════════════════════════════════════════════════════════════════════
 
-    # ── D: DATA (SharePoint) ───────────────────────────────────────────
-    "sp_search_documents":    ("D", {P0, P2},                "SharePoint durchsuchen"),
-    "sp_get_document":        ("D", {P2, P3c},               "Dokument lesen"),
-    "sp_list_folder":         ("D", {P0},                    "Ordner auflisten"),
-    "sp_get_document_content":("D", {P3c},                   "Dokumentinhalt lesen"),
+    "elster_build_declaration": ("E", {P_ACT, P_PERSIST},   "ELSTER bauen — Dokument für Dispatch"),
+    "elster_validate":          ("E", {P_ACT, P_PERSIST},  "ELSTER validieren — vor Dispatch"),
+    # elster_submit → ORCHESTRATOR_DISPATCH_TOOLS (nur nach Mandant-OK)
+    "elster_get_status":        ("E", {P_KONTEXT, P_ORIENT}, "ELSTER Status"),
+    "elster_get_form_fields":   ("E", {P_ORIENT},          "ELSTER Felder"),
+    "ask_external":             ("E", {P_ORIENT},          "Externe LLM-API (Notfall)"),
+}
 
-    # ── D: DATA (Calendar) ──────────────────────────────────────────────
-    "list_events":            ("D", {P0, P2},                "Kalendereinträge"),
-    "check_today":            ("D", {P0},                    "Heutige Termine"),
-    "check_overdue":          ("D", {P0},                    "Überfällige Aufgaben"),
+# ══════════════════════════════════════════════════════════════════════════════
+# ORCHESTRATOR-DISPATCH-Tools — NICHT im LLM-Tool-Set!
+# Der Orchestrator ruft diese nach Phase 4b (Validate) direkt auf.
+# Das LLM sieht sie nie — es generiert Drafts, der Orchestrator dispatcht.
+#
+# Kategorie C: COMMUNICATE — Nachrichten an Menschen/Agenten
+# Kategorie X: EXTERNAL WRITE — Schreibzugriff auf externe Systeme
+#
+# Alles was nach AUSSEN geht (nicht in den eigenen Workspace) ist Dispatch.
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # ── D: DATA (Vision — externe API) ──────────────────────────────────
-    "analyze_image":          ("D", {P3c},                   "Bild via externe Vision-API"),
+ORCHESTRATOR_DISPATCH_TOOLS = {
+    # C: COMMUNICATE — Nachrichten an Menschen
+    "send_email",
+    "send_telegram_message",
+    "send_telegram_file",
+    "send_voice_message",
+    "send_to_agent",
+    "teams_send_message",
+    "teams_create_meeting",
 
-    # ── W: WRITE (Workspace) ────────────────────────────────────────────
-    "write_file":             ("W", {P4},                    "Workspace-Datei schreiben"),
-    "remember":               ("W", {P4},                    "Fakt ins Langzeitgedächtnis"),
-    "forget":                 ("W", {P4},                    "Fakt löschen"),
-    "update_customer":        ("W", {P4},                    "Kundendaten aktualisieren"),
-    "add_contact":            ("W", {P4},                    "Kontakt anlegen"),
-    "store_chunk_summary":    ("W", {P3c, P4},               "Chunk-Zusammenfassung speichern"),
-
-    # ── W: WRITE (externe Systeme) ──────────────────────────────────────
-    "cb_create_item":         ("W", {P3, P4},                "Requirement anlegen"),
-    "cb_update_item":         ("W", {P3, P4},                "Requirement aktualisieren"),
-    "cb_add_comment":         ("W", {P3, P4},                "Kommentar zu Requirement"),
-    "jira_create_issue":      ("W", {P3, P4},                "JIRA Issue anlegen"),
-    "jira_update_status":     ("W", {P3, P4},                "JIRA Status ändern"),
-    "jira_add_comment":       ("W", {P3, P4},                "JIRA Kommentar"),
-    "azdo_create_work_item":  ("W", {P3, P4},                "Azure DevOps Work Item"),
-    "azdo_update_work_item":  ("W", {P3, P4},                "Work Item aktualisieren"),
-    "azdo_add_comment":       ("W", {P3, P4},                "Kommentar hinzufügen"),
-    "confluence_create_page":  ("W", {P4},                   "Confluence-Seite erstellen"),
-    "confluence_update_page":  ("W", {P4},                   "Confluence-Seite aktualisieren"),
-    "sp_upload_document":     ("W", {P4},                    "SharePoint-Upload"),
-
-    # ── C: COMMUNICATE (Nachrichten an Menschen) ────────────────────────
-    "send_email":             ("C", {P3},                    "Email an Stakeholder"),
-    "send_telegram_message":  ("C", {P3},                    "Telegram-Nachricht"),
-    "send_telegram_file":     ("C", {P3},                    "Telegram-Datei senden"),
-    "send_voice_message":     ("C", {P3},                    "Sprachnachricht senden"),
-    "send_to_agent":          ("C", {P3},                    "An anderen Agent delegieren"),
-    "teams_send_message":     ("C", {P3},                    "Teams-Nachricht"),
-    "teams_create_meeting":   ("C", {P3},                    "Teams-Meeting erstellen"),
-    "teams_get_messages":     ("D", {P0, P2},                "Teams-Nachrichten lesen"),
-    "teams_list_channels":    ("D", {P0},                    "Teams-Kanäle auflisten"),
-    "teams_list_teams":       ("D", {P0},                    "Teams auflisten"),
-
-    # ── S: SCHEDULE (zeitgesteuert) ─────────────────────────────────────
-    "set_reminder":           ("S", {P4},                    "Erinnerung setzen"),
-    "add_event":              ("S", {P4},                    "Kalendereintrag erstellen"),
-    "complete_event":         ("S", {P4},                    "Termin als erledigt markieren"),
-    "delete_event":           ("S", {P4},                    "Termin löschen"),
-    "list_jobs":              ("S", {P0, P4},                "Geplante Jobs anzeigen"),
-    "add_task":               ("S", {P4},                    "Aufgabe erstellen"),
-    "update_task":            ("S", {P4},                    "Aufgabe aktualisieren"),
-    "complete_task":          ("S", {P4},                    "Aufgabe abschließen"),
-
-    # ── E: EXTERNAL (spezialisierte Systeme) ─────────────────────────────
-    "elster_build_declaration": ("E", {P4},                  "ELSTER-Erklärung bauen"),
-    "elster_validate":          ("E", {P4},                  "ELSTER validieren"),
-    "elster_submit":            ("E", {P3},                  "ELSTER einreichen (NUR nach OK!)"),
-    "elster_get_status":        ("E", {P0, P2},              "ELSTER-Status abfragen"),
-    "elster_get_form_fields":   ("E", {P2},                  "Formularfelder abfragen"),
-    "ask_external":             ("E", {P2},                  "Externe LLM-API (Notfall)"),
-
-    # ── Office-Dokumente (generieren) ───────────────────────────────────
-    "create_word_document":     ("W", {P4},                  "Word-Dokument erstellen"),
-    "create_excel_sheet":       ("W", {P4},                  "Excel erstellen"),
-    "create_pptx_presentation": ("W", {P4},                  "PowerPoint erstellen"),
-    "create_pdf":               ("W", {P4},                  "PDF erstellen"),
-    "convert_document":         ("W", {P4},                  "Dokument konvertieren"),
-
-    # ── Reporting ───────────────────────────────────────────────────────
-    "html_report_create":       ("W", {P4},                  "HTML-Report erstellen"),
-    "html_report_status_dashboard": ("W", {P4},              "Status-Dashboard"),
-    "html_report_with_chart":   ("W", {P4},                  "Report mit Charts"),
-    "report_daily_summary":     ("R", {P2, P4},              "Tagesübersicht"),
-    "report_weekly_overview":   ("R", {P2},                   "Wochenübersicht"),
+    # X: EXTERNAL WRITE — Schreiben in externe Systeme
+    # (LLM drafted den Inhalt, Orchestrator führt den Write aus)
+    "cb_create_item",
+    "cb_update_item",
+    "cb_add_comment",
+    "jira_create_issue",
+    "jira_update_status",
+    "jira_add_comment",
+    "azdo_create_work_item",
+    "azdo_update_work_item",
+    "azdo_add_comment",
+    "confluence_create_page",
+    "confluence_update_page",
+    "sp_upload_document",
+    "elster_submit",
 }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Compliance Check Functions
+#  API Functions
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_allowed_phases(tool_name: str) -> set[str] | None:
+def get_allowed_phases(tool_name: str) -> Optional[set[str]]:
     """Returns the allowed phases for a tool, or None if not registered."""
+    if tool_name in ORCHESTRATOR_DISPATCH_TOOLS:
+        return set()  # Never available to LLM
     entry = TOOL_REGISTRY.get(tool_name)
     return entry[1] if entry else None
 
 
-def get_category(tool_name: str) -> str | None:
-    """Returns the category code (R/D/W/C/S/E) for a tool."""
+def get_category(tool_name: str) -> Optional[str]:
+    """Returns the category code (R/D/W/S/E) for a tool, or 'C' for dispatch tools."""
+    if tool_name in ORCHESTRATOR_DISPATCH_TOOLS:
+        return "C"
     entry = TOOL_REGISTRY.get(tool_name)
     return entry[0] if entry else None
 
 
 def is_allowed_in_phase(tool_name: str, phase: str) -> bool:
     """Check if a tool is allowed in a specific OODA phase."""
+    if tool_name in ORCHESTRATOR_DISPATCH_TOOLS:
+        return False  # Never allowed for LLM
     phases = get_allowed_phases(tool_name)
     if phases is None:
         log.warning(f"Tool '{tool_name}' not registered in TOOL_PHASE_REGISTRY")
-        return True  # Unregistered tools are allowed (with warning)
+        return True  # Unregistered tools allowed with warning
     return phase in phases
 
 
-def check_agent_compliance(config: dict) -> list[str]:
-    """Check if an agent's skill configuration is OODA-compliant.
+def get_tools_for_phase(phase: str) -> list[str]:
+    """Returns all tool names the LLM may use in a specific phase."""
+    return [name for name, (_, phases, _) in TOOL_REGISTRY.items() if phase in phases]
 
-    Returns list of warnings/errors. Empty list = compliant.
+
+def filter_tools_for_phase(all_tools: list[dict], phase: str) -> list[dict]:
+    """Filter Ollama tool definitions to only those allowed in a phase.
+
+    Removes COMMUNICATE tools entirely (orchestrator handles those).
+    Removes tools not allowed in the current phase.
+
+    Args:
+        all_tools: List of tool dicts (Ollama format with 'function.name')
+        phase: Current OODA phase ("0"-"5")
+
+    Returns:
+        Filtered list containing only tools allowed in this phase.
     """
+    allowed = set(get_tools_for_phase(phase))
+    filtered = []
+    for tool in all_tools:
+        name = tool.get("function", {}).get("name", "")
+        if name in ORCHESTRATOR_DISPATCH_TOOLS:
+            continue  # Never expose to LLM
+        if name in allowed or name not in TOOL_REGISTRY:
+            filtered.append(tool)
+    if len(filtered) < len(all_tools):
+        log.debug(
+            f"Phase {phase} ({PHASE_NAMES.get(phase, '?')}): "
+            f"{len(filtered)}/{len(all_tools)} tools for LLM "
+            f"({len(all_tools) - len(filtered)} filtered out)"
+        )
+    return filtered
+
+
+def check_agent_compliance(config: dict) -> list[str]:
+    """Check if an agent's configuration is OODA-compliant."""
     warnings = []
     strategy = config.get("execution_strategy", "reactive")
 
     if strategy != "batch":
-        return []  # Only OODA agents are checked
+        return []
 
     skills = set(config.get("skills", []))
 
-    # Pflicht: file_ops
     if "file_ops" not in skills:
-        warnings.append("CRITICAL: Worker ohne file_ops — kann keine Workspace-Dateien lesen")
-
-    # Pflicht: persistence
+        warnings.append("CRITICAL: Worker ohne file_ops")
     if "persistence" not in skills:
-        warnings.append("WARNING: Worker ohne persistence — kein Langzeitgedächtnis")
-
-    # Kommunikation
-    comm_skills = {"email", "ms_teams"} & skills
-    if not comm_skills:
-        warnings.append("WARNING: Worker ohne email/teams — kann Stakeholder nicht kontaktieren")
-
-    # OCR bei workspace_scan
+        warnings.append("WARNING: Worker ohne persistence")
     if config.get("batch_workspace_scan") and "document_ocr" not in skills:
         warnings.append("CRITICAL: batch_workspace_scan=true ohne document_ocr")
 

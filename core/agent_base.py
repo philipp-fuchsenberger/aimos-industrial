@@ -34,7 +34,7 @@ from core.dispatch import DispatchMixin
 from core.output_firewall import (
     OutputFirewallMixin,
     STOP_SEQUENCES,
-    _CHINESE_STOP_TOKENS,
+    # _CHINESE_STOP_TOKENS removed — no longer needed with qwen3.5 + proper prompts
     clean_llm_response,
 )
 
@@ -160,6 +160,49 @@ _TOOL_RINGS = {
     "get_customer_balance": 0, "list_unpaid_invoices": 0,
     "search_transactions": 0, "get_daily_summary": 0,
     "remote_list_files": 0, "remote_read_file": 0,
+    "jira_search_issues": 0, "jira_get_issue": 0,
+    "jira_create_issue": 1, "jira_update_status": 1, "jira_add_comment": 1,
+    "elster_validate": 0, "elster_get_status": 0, "elster_get_form_fields": 0,
+    "elster_submit": 1, "elster_build_declaration": 1,
+    "azdo_search_work_items": 0, "azdo_get_work_item": 0, "azdo_list_pipelines": 0,
+    "azdo_create_work_item": 1, "azdo_update_work_item": 1, "azdo_add_comment": 1,
+    "msproject_list_projects": 0, "msproject_get_project": 0,
+    "msproject_list_tasks": 0, "msproject_get_task": 0,
+    "msproject_update_task": 1, "msproject_create_task": 1,
+    "teams_list_teams": 0, "teams_list_channels": 0, "teams_get_messages": 0,
+    "teams_send_message": 1, "teams_create_meeting": 1,
+    "sp_list_sites": 0, "sp_search_documents": 0, "sp_get_document": 0,
+    "sp_list_folder": 0, "sp_get_document_content": 0,
+    "sp_upload_document": 1,
+    "dropbox_list_folder": 0, "dropbox_download_file": 0,
+    "dropbox_check_new_files": 0, "dropbox_sync_folder": 0,
+    "dropbox_get_file_info": 0,
+    "cb_search_items": 0, "cb_get_item": 0, "cb_get_item_relations": 0,
+    "cb_get_baselines": 0, "cb_compare_baselines": 0,
+    "cb_create_item": 1, "cb_update_item": 1, "cb_add_comment": 1,
+    "confluence_search": 0, "confluence_get_page": 0, "confluence_get_space_pages": 0,
+    "confluence_create_page": 1, "confluence_update_page": 1,
+    "erp_search_articles": 0, "erp_get_article": 0,
+    "erp_search_customers": 0, "erp_get_customer": 0,
+    "erp_get_open_orders": 0, "erp_get_stock": 0,
+    "compliance_list_deadlines": 0, "compliance_get_item": 0,
+    "compliance_list_overdue": 0, "compliance_search": 0,
+    "compliance_add_item": 1, "compliance_update_status": 1,
+    "inventory_check_stock": 0, "inventory_list_low_stock": 0,
+    "inventory_search": 0, "inventory_generate_reorder_list": 0,
+    "inventory_update_stock": 1, "inventory_add_article": 1,
+    "git_list_merge_requests": 0, "git_get_merge_request": 0,
+    "git_list_pipelines": 0, "git_get_commits": 0,
+    "git_add_comment": 1, "git_create_issue": 1,
+    "report_daily_summary": 0, "report_weekly_overview": 0,
+    "report_export_csv": 0, "report_custom": 0, "report_list_generated": 0,
+    "html_report_create": 0, "html_report_with_chart": 0,
+    "html_report_status_dashboard": 0, "html_list_reports": 0,
+    "ocr_extract_text": 0, "ocr_extract_fields": 0, "ocr_list_scannable": 0,
+    "list_office_files": 0,
+    "create_word_document": 1, "create_excel_sheet": 1, "create_pptx_presentation": 1,
+    "outlook_list_events": 0, "outlook_get_event": 0,
+    "outlook_create_event": 1, "outlook_update_event": 1, "outlook_delete_event": 1,
     # Ring 1 — Write
     "send_telegram_message": 1, "send_voice_message": 1, "send_to_agent": 1,
     "send_email": 1, "write_file": 1, "send_telegram_file": 1,
@@ -863,6 +906,26 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
         if name not in self._tools:
             return json.dumps({"error": f"Unknown tool: {name}"})
 
+        # CR-273: OODA Phase enforcement — block tools not allowed in current phase
+        # This is the EXECUTION-LEVEL guard. Even if the LLM "guesses" a tool name
+        # that was filtered from the prompt, this prevents actual execution.
+        ooda_phase = getattr(self, '_ooda_phase', None)
+        if ooda_phase is not None:
+            from core.tool_phase_registry import is_allowed_in_phase, ORCHESTRATOR_DISPATCH_TOOLS
+            if name in ORCHESTRATOR_DISPATCH_TOOLS:
+                self.logger.warning(
+                    f"[{self.agent_name}] CR-273 BLOCKED: '{name}' is an Orchestrator-only tool "
+                    f"(not callable by LLM in any phase)"
+                )
+                self._audit("TOOL_BLOCKED", f"{name} is ORCHESTRATOR_DISPATCH (never LLM)")
+                return json.dumps({"error": f"Tool '{name}' is handled by the Orchestrator, not available to you. Write your response as plain text instead."})
+            if not is_allowed_in_phase(name, ooda_phase):
+                self.logger.warning(
+                    f"[{self.agent_name}] CR-273 BLOCKED: '{name}' not allowed in phase {ooda_phase}"
+                )
+                self._audit("TOOL_BLOCKED", f"{name} not allowed in phase {ooda_phase}")
+                return json.dumps({"error": f"Tool '{name}' is not available in this phase. Current phase only allows specific tools."})
+
         # CR-142: Execution Ring policy check
         ring_required = _TOOL_RINGS.get(name, 1)  # unknown tools default to Ring 1
         agent_ring = self.config.get("max_ring", 2)  # default Ring 2 (backward-compat)
@@ -1086,7 +1149,11 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
                 "num_predict": num_predict,
                 "num_gpu": -1,  # Force all layers to GPU (prevents CPU fallback)
             },
-            "stop": _CHINESE_STOP_TOKENS,
+            # Stop sequences: tool-call delimiters + model-specific tokens
+            # Note: _CHINESE_STOP_TOKENS removed — qwen3.5 with proper system prompt
+            # no longer produces Chinese output (verified 2026-04-03). The old stop tokens
+            # were a workaround for qwen2.5 without context, no longer needed.
+            "stop": STOP_SEQUENCES,
         }
         if tools:
             payload["tools"] = tools
@@ -1365,7 +1432,7 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
                 session_boost = 1.0
                 session_id = getattr(self, '_current_session_id', '')
                 if session_id:
-                    # Extract identifier (e.g. "123456789" from "telegram:123456789")
+                    # Extract identifier (e.g. "7995386919" from "telegram:7995386919")
                     sid_parts = session_id.split(":", 1)
                     sid_val = sid_parts[1] if len(sid_parts) > 1 else session_id
                     key_lower = (key or "").lower()
@@ -1497,6 +1564,18 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
 
         tool_block = self._build_tool_block()
         ollama_tools = self._build_ollama_tools()
+
+        # CR-273: OODA Phase-based tool filtering for batch agents
+        ooda_phase = getattr(self, '_ooda_phase', None)
+        if ooda_phase is not None and ollama_tools:
+            from core.tool_phase_registry import filter_tools_for_phase, PHASE_NAMES
+            pre_count = len(ollama_tools)
+            ollama_tools = filter_tools_for_phase(ollama_tools, ooda_phase)
+            self.logger.info(
+                f"[{self.agent_name}] CR-273 Tool-Filter: Phase {ooda_phase} "
+                f"({PHASE_NAMES.get(ooda_phase, '?')}) → {len(ollama_tools)}/{pre_count} tools"
+            )
+
         memory_block = self._load_memory_context()
         chats_block = await self._load_active_chats()
         # CR-144: Inject calendar events (overdue, today, upcoming)
@@ -1515,9 +1594,19 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
             pass
         # Build system prompt: Core → User prompt → Memory → Calendar → Projects → Active Chats
         system = self._CORE_SYSTEM_PROMPT + self._system_prompt + memory_block + calendar_block + project_block + chats_block
-        # Text-based tool block is only for models without native tool-calling (deepseek, gemma).
-        # Models with native support (qwen, mistral) get tool definitions via the API.
-        if tool_block and not ollama_tools:
+        # CR-248: Tool awareness in system prompt.
+        # - With native tools: Short hint that tools exist (API handles the details).
+        #   Do NOT list tool names — that causes the LLM to write text about tools
+        #   instead of making native API calls.
+        # - Without native tools: Full text-based tool block as fallback.
+        if ollama_tools:
+            system += (
+                "\n\nYou have tools available. The system provides them automatically. "
+                "When you need to perform an action (write file, send email, store data), "
+                "use the corresponding tool call. Do NOT write code or describe the call — "
+                "execute it directly."
+            )
+        elif tool_block:
             system += "\n\n" + tool_block
 
         # CR-115: Filter history to current conversation thread (Telegram/internal/scheduled)
@@ -1620,11 +1709,14 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
             response_text = response_text.replace(seq, "")
         answer = clean_llm_response(response_text, tool_was_called=any_tool_called)
 
-        # CR-114b: Phantom-action detection — strip false claims about actions not taken
-        answer = await self._strip_phantom_actions(answer, tool_results_this_cycle)
+        # CR-114b: Phantom-action detection — only for reactive agents (Support, Chat)
+        # Batch agents (Steuerberater, FuSa) handle their own quality via system prompt
+        if self.config.get("execution_strategy") != "batch":
+            answer = await self._strip_phantom_actions(answer, tool_results_this_cycle)
 
-        # Loop detection: if 2 consecutive responses are >60% similar, escalate
-        answer = await self._check_loop_and_escalate(answer, user_message)
+        # Loop detection: only for reactive agents (batch has history isolation)
+        if self.config.get("execution_strategy") != "batch":
+            answer = await self._check_loop_and_escalate(answer, user_message)
 
         await self._persist_message("assistant", answer)
         return answer
