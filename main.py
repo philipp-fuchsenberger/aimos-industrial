@@ -397,7 +397,7 @@ async def _run_orchestrator(agent: AIMOSAgent, shutdown_event: asyncio.Event):
                     ):
                         late_msgs = await agent.poll_pending()
                         if not late_msgs:
-                            log.info(f"[CR-213] Check-before-Send: no late messages — sending reply")
+                            log.info("[CR-213] Check-before-Send: no late messages — sending reply")
                         if late_msgs:
                             # L4: For email kind, filter by thread_id instead of sender_id
                             # (sender_id=0 for all emails would match everything)

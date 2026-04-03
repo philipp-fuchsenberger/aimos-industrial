@@ -77,7 +77,6 @@ def _sanitize_filename(raw_name: str, fallback_prefix: str = "file") -> str:
         return f"{fallback_prefix}_{hashlib.md5(str(time.time()).encode()).hexdigest()[:8]}"
 
     # Strip path components — only keep the filename
-    import os
     name = os.path.basename(raw_name)
 
     # Remove null bytes and control characters

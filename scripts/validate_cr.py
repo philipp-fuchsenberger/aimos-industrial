@@ -324,7 +324,7 @@ def main():
     # Structural tests (always run)
     results.append(("DB Connection", test_db_connection()))
     if not results[-1][1]:
-        print(f"\n  ABORT: Cannot connect to database.\n")
+        print("\n  ABORT: Cannot connect to database.\n")
         sys.exit(1)
 
     results.append(("Tables", test_tables_exist()))
