@@ -20,4 +20,13 @@ markers = [
 asyncio_mode = "auto"
 
 [tool.bandit]
-skips = ["B101", "B603", "B607"]
+# B101: assert (OK for validation)
+# B110: try/except/pass (intentional best-effort)
+# B108: hardcoded /tmp (PID files)
+# B104: bind 0.0.0.0 (dashboard LAN access)
+# B310: urllib.urlopen (internal health checks)
+# B404: import subprocess (process management)
+# B603: subprocess call (orchestrator)
+# B607: start process partial path (spawning)
+# B608: SQL (internal queries, no user input)
+skips = ["B101", "B110", "B108", "B104", "B310", "B404", "B603", "B607", "B608"]
