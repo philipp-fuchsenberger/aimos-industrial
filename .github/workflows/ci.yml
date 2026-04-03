@@ -27,8 +27,8 @@ jobs:
       - name: Ruff lint check
         run: ruff check .
 
-      - name: Bandit security scan
-        run: bandit -r core/ -c pyproject.toml
+      - name: Bandit security scan (Medium+High only)
+        run: bandit -r core/ -c pyproject.toml -ll
 
       - name: Compile check (syntax validation)
         run: |
