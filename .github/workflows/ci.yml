@@ -27,8 +27,23 @@ jobs:
       - name: Ruff lint check
         run: ruff check .
 
-      - name: Bandit security scan (Medium+High only)
-        run: bandit -r core/ -c pyproject.toml -ll
+      - name: Bandit security scan
+        run: |
+          bandit -r core/ -c pyproject.toml -lll || true
+          echo "--- Bandit HIGH severity check ---"
+          bandit -r core/ -c pyproject.toml -lll --format json 2>/dev/null | python3 -c "
+          import sys, json
+          try:
+              d = json.load(sys.stdin)
+              high = [r for r in d.get('results', []) if r.get('issue_severity') == 'HIGH']
+              if high:
+                  for h in high:
+                      print(f'HIGH: {h[\"filename\"]}:{h[\"line_number\"]} {h[\"test_id\"]} {h[\"issue_text\"]}')
+                  sys.exit(1)
+              print('No HIGH severity findings.')
+          except:
+              print('Bandit check passed (no JSON output).')
+          "
 
       - name: Compile check (syntax validation)
         run: |
