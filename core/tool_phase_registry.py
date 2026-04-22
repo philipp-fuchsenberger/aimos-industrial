@@ -295,14 +295,31 @@ def get_category(tool_name: str) -> Optional[str]:
 
 
 def is_allowed_in_phase(tool_name: str, phase: str) -> bool:
-    """Check if a tool is allowed in a specific OODA phase."""
+    """Check if a tool is allowed in a specific OODA phase.
+
+    Supports sub-phases (e.g. "4a", "4b"):
+      "4a" DRAFT:    only READ category tools from Phase 4
+      "4b" VALIDATE: only current_time
+    """
     if tool_name in ORCHESTRATOR_DISPATCH_TOOLS:
         return False  # Never allowed for LLM
     phases = get_allowed_phases(tool_name)
     if phases is None:
         log.warning(f"Tool '{tool_name}' not registered in TOOL_PHASE_REGISTRY")
         return True  # Unregistered tools allowed with warning
-    return phase in phases
+
+    parent_phase = phase[0] if len(phase) > 1 else phase
+    if parent_phase not in phases:
+        return False  # Not allowed in parent phase at all
+
+    # Sub-phase restrictions
+    if phase == P_ACT_DRAFT:
+        entry = TOOL_REGISTRY.get(tool_name)
+        return entry is not None and entry[0] == "R"  # READ only
+    elif phase == P_ACT_VALIDATE:
+        return tool_name == "current_time"  # Minimal
+
+    return True
 
 
 def get_tools_for_phase(phase: str) -> list[str]:
@@ -316,14 +333,31 @@ def filter_tools_for_phase(all_tools: list[dict], phase: str) -> list[dict]:
     Removes COMMUNICATE tools entirely (orchestrator handles those).
     Removes tools not allowed in the current phase.
 
+    Supports sub-phases for fine-grained control:
+      "4a" (DRAFT)    → READ-only subset of Phase 4 tools
+      "4b" (VALIDATE) → current_time only
+      "2a" / "2b"     → same as Phase 2
+
     Args:
         all_tools: List of tool dicts (Ollama format with 'function.name')
-        phase: Current OODA phase ("0"-"5")
+        phase: Current OODA phase ("0"-"5") or sub-phase ("2a","2b","4a","4b")
 
     Returns:
         Filtered list containing only tools allowed in this phase.
     """
-    allowed = set(get_tools_for_phase(phase))
+    # Map sub-phases to parent phase for base filtering
+    parent_phase = phase[0] if len(phase) > 1 else phase
+    allowed = set(get_tools_for_phase(parent_phase))
+
+    # Sub-phase restrictions: further narrow the allowed set
+    if phase == P_ACT_DRAFT:
+        # 4a DRAFT: only READ tools — LLM writes plain text, no side effects
+        allowed = {name for name in allowed
+                   if TOOL_REGISTRY.get(name, ("",))[0] == "R"}
+    elif phase == P_ACT_VALIDATE:
+        # 4b VALIDATE: minimal — only current_time
+        allowed = {"current_time"}
+
     filtered = []
     for tool in all_tools:
         name = tool.get("function", {}).get("name", "")
@@ -331,9 +365,13 @@ def filter_tools_for_phase(all_tools: list[dict], phase: str) -> list[dict]:
             continue  # Never expose to LLM
         if name in allowed or name not in TOOL_REGISTRY:
             filtered.append(tool)
+
+    phase_label = PHASE_NAMES.get(parent_phase, phase)
+    if phase != parent_phase:
+        phase_label = f"{phase_label}/{phase}"
     if len(filtered) < len(all_tools):
         log.debug(
-            f"Phase {phase} ({PHASE_NAMES.get(phase, '?')}): "
+            f"Phase {phase_label}: "
             f"{len(filtered)}/{len(all_tools)} tools for LLM "
             f"({len(all_tools) - len(filtered)} filtered out)"
         )

@@ -75,6 +75,9 @@ CREATE TABLE IF NOT EXISTS agents (
     config          JSONB DEFAULT '{}'::jsonb,
     env_secrets     JSONB DEFAULT '{}'::jsonb,
     wake_up_needed  BOOLEAN DEFAULT FALSE,
+    -- §126/A H22: per-tenant isolation. Default tenant 'default' for all
+    -- legacy agents. Multi-tenant deployments use distinct tenant_ids.
+    tenant_id       TEXT NOT NULL DEFAULT 'default',
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
@@ -88,7 +91,17 @@ CREATE TABLE IF NOT EXISTS pending_messages (
     file_path   TEXT,
     thread_id   TEXT DEFAULT '',
     processed   BOOLEAN DEFAULT FALSE,
-    created_at  TIMESTAMPTZ DEFAULT NOW()
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    -- CR-286: project_id carries the per-cycle project context for ADM
+    -- pipeline messages. NULL for classic agents (Telegram/email/voice).
+    project_id    TEXT,
+    parent_msg_id INTEGER,  -- audit trail: which upstream msg produced this one
+    -- §126/A H22: per-tenant isolation. Default tenant 'default' for legacy.
+    tenant_id     TEXT NOT NULL DEFAULT 'default',
+    -- §126/A H2: loop counter per project_id, hard cap to prevent cascade loops
+    loop_depth    INTEGER NOT NULL DEFAULT 0,
+    -- §126/A H10: cumulative cost in EUR-cents for this message's pipeline run
+    cost_cents    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS aimos_chat_histories (
@@ -109,6 +122,17 @@ CREATE INDEX IF NOT EXISTS idx_chat_session ON aimos_chat_histories(agent_name, 
 -- CR-thread: thread_id migration for existing databases
 ALTER TABLE pending_messages ADD COLUMN IF NOT EXISTS thread_id TEXT DEFAULT '';
 ALTER TABLE aimos_chat_histories ADD COLUMN IF NOT EXISTS thread_id TEXT DEFAULT '';
+-- CR-286: project_id + parent_msg_id migration for existing databases
+ALTER TABLE pending_messages ADD COLUMN IF NOT EXISTS project_id TEXT;
+ALTER TABLE pending_messages ADD COLUMN IF NOT EXISTS parent_msg_id INTEGER;
+CREATE INDEX IF NOT EXISTS idx_pending_project ON pending_messages(project_id, agent_name) WHERE project_id IS NOT NULL;
+-- §126/A H22 + H2 + H10: tenant isolation, loop counter, cost cap migrations
+ALTER TABLE pending_messages ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE pending_messages ADD COLUMN IF NOT EXISTS loop_depth INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE pending_messages ADD COLUMN IF NOT EXISTS cost_cents INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';
+CREATE INDEX IF NOT EXISTS idx_pending_tenant ON pending_messages(tenant_id, agent_name);
+CREATE INDEX IF NOT EXISTS idx_agents_tenant ON agents(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_chat_thread ON aimos_chat_histories(agent_name, thread_id);
 CREATE INDEX IF NOT EXISTS idx_pending_thread ON pending_messages(agent_name, thread_id);
 
@@ -129,6 +153,80 @@ CREATE TABLE IF NOT EXISTS agent_jobs (
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     fired_at        TIMESTAMPTZ
 );
+
+-- §126/A H10: per-project cost accumulator with hard cap.
+-- Persisted (not just in-memory) so multiple subprocesses see the same total.
+-- Cost in EUR-cents (integer to avoid float drift).
+-- §B/H1: also tracks retry_count for auto-retry on stall
+CREATE TABLE IF NOT EXISTS project_cost (
+    project_id     TEXT PRIMARY KEY,
+    tenant_id      TEXT NOT NULL DEFAULT 'default',
+    cost_cents     INTEGER NOT NULL DEFAULT 0,
+    cap_cents      INTEGER NOT NULL DEFAULT 1000,  -- €10 default
+    blocked        BOOLEAN NOT NULL DEFAULT FALSE,
+    retry_count    INTEGER NOT NULL DEFAULT 0,
+    last_retry_at  TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_project_cost_tenant ON project_cost(tenant_id);
+ALTER TABLE project_cost ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE project_cost ADD COLUMN IF NOT EXISTS last_retry_at TIMESTAMPTZ;
+
+-- §P2.1: Telegram Bot-Token-Pool fuer automatisches Deployment.
+-- Tokens werden manuell via BotFather erstellt und hier eingetragen.
+-- fab0_deploy weist dem neuen Agent den naechsten freien Token zu.
+CREATE TABLE IF NOT EXISTS bot_token_pool (
+    id          SERIAL PRIMARY KEY,
+    token       TEXT UNIQUE NOT NULL,
+    bot_name    TEXT,                          -- BotFather-Name (z.B. @aimos_faq_bot)
+    status      TEXT NOT NULL DEFAULT 'available',  -- available, assigned, revoked
+    agent_name  TEXT,                          -- NULL=frei, sonst zugewiesener Agent
+    tenant_id   TEXT NOT NULL DEFAULT 'default',
+    assigned_at TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_bot_token_pool_status ON bot_token_pool(status);
+
+-- SW2-1: API Key Pool fuer Multi-Key-Management (LLM Switchboard)
+CREATE TABLE IF NOT EXISTS api_key_pool (
+    id              SERIAL PRIMARY KEY,
+    provider        TEXT NOT NULL,
+    api_key         TEXT NOT NULL,
+    label           TEXT DEFAULT '',
+    status          TEXT DEFAULT 'active'
+                    CHECK (status IN ('active','exhausted','revoked','rate_limited')),
+    rate_limit      INTEGER,
+    last_used_at    TIMESTAMPTZ,
+    error_count     INTEGER DEFAULT 0,
+    cooldown_until  TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    tenant_id       TEXT DEFAULT 'default'
+);
+CREATE INDEX IF NOT EXISTS idx_key_pool_provider ON api_key_pool(provider, status);
+
+-- SW3-1: LLM Call Log fuer strukturiertes Cost-Tracking
+CREATE TABLE IF NOT EXISTS llm_call_log (
+    id              BIGSERIAL PRIMARY KEY,
+    ts              TIMESTAMPTZ DEFAULT NOW(),
+    agent_name      TEXT,
+    project_id      TEXT,
+    tenant_id       TEXT DEFAULT 'default',
+    provider        TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    in_tokens       INTEGER NOT NULL DEFAULT 0,
+    out_tokens      INTEGER NOT NULL DEFAULT 0,
+    cost_usd        REAL NOT NULL DEFAULT 0,
+    latency_ms      INTEGER,
+    status          TEXT DEFAULT 'ok',
+    error_msg       TEXT,
+    priority        INTEGER,
+    key_label       TEXT,
+    was_fallback    BOOLEAN DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS idx_call_log_agent ON llm_call_log(agent_name, ts);
+CREATE INDEX IF NOT EXISTS idx_call_log_provider ON llm_call_log(provider, ts);
+CREATE INDEX IF NOT EXISTS idx_call_log_ts ON llm_call_log(ts);
 """
 
 _WATCHDOG_TIMEOUT = 900  # 15 minutes — CR-166: extended for long multi-tool chains
@@ -242,6 +340,13 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
         self._memory_db_path: Optional[Path] = None
         self._recent_responses: list[str] = []  # last 2 responses for loop detection
         self._env_secrets: dict[str, str] = {}  # CR-222: populated by _load_secrets()
+        # §126/A H22: tenant_id loaded from agents table at startup, default 'default'
+        self._tenant_id: str = self.config.get("tenant_id", "default")
+
+        # §136: Resolve agent type once at init
+        from core.agent_types import get_agent_type
+        self.config["name"] = self.agent_name
+        self._agent_type: str = get_agent_type(self.config)
 
         # Schema prefix: memory_{agent_id} (sanitized to valid PG identifier)
         _safe = re.sub(r"[^a-z0-9]", "_", self.agent_name)
@@ -293,6 +398,21 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
             )
 
         self._touch()
+
+        # SW1-7: Initialize LLM Switchboard (Circuit Breaker, Fallback, Providers)
+        try:
+            from core.llm.bootstrap import init_llm_switchboard
+            await init_llm_switchboard(db_pool=self._pool)
+            # P3.6: Preload agent budget from DB
+            from core.llm.router import get_switchboard
+            sb = get_switchboard()
+            if sb:
+                await sb.preload_agent_budget(self.agent_name)
+        except Exception as exc:
+            self.logger.warning(
+                f"[{self.agent_name}] Switchboard init failed, using legacy router: {exc}"
+            )
+
         self.logger.info(f"[{self.agent_name}] Agent ready (status=active).")
 
     async def _compress_history(self):
@@ -473,10 +593,22 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
         """Load config from agents table and merge into self.config / system_prompt."""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT config FROM agents WHERE name=$1", self.agent_name
+                "SELECT config, tenant_id FROM agents WHERE name=$1", self.agent_name
             )
         if not row or not row["config"]:
             return
+
+        # §126/A H22: load tenant_id from DB. Validate via core.tenant.
+        try:
+            from core.tenant import validate_tenant_id
+            self._tenant_id = validate_tenant_id(row["tenant_id"] or "default")
+            self.logger.info(f"[{self.agent_name}] tenant_id={self._tenant_id}")
+        except Exception as exc:
+            self.logger.warning(
+                f"[{self.agent_name}] tenant_id load failed ({exc}), "
+                f"falling back to 'default'"
+            )
+            self._tenant_id = "default"
 
         db_cfg = row["config"]
         if isinstance(db_cfg, str):
@@ -559,9 +691,18 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _init_audit_log(self):
-        """Set up the audit log file at storage/agents/{agent_name}/api_audit.log."""
+        """Set up the audit log file at storage/agents/{agent_name}/api_audit.log.
+
+        For meta agents during startup (before project context is set),
+        falls back to the default agent storage path.
+        """
         from core.skills.base import BaseSkill
-        base = BaseSkill.workspace_path(self.agent_name)  # also creates /public
+        try:
+            base = BaseSkill.workspace_path(self.agent_name)
+        except PermissionError:
+            # Meta agent without project context yet — use default storage
+            base = Path("storage/agents") / self.agent_name
+            base.mkdir(parents=True, exist_ok=True)
         self._audit_path = base / "api_audit.log"
 
     def _init_memory_db(self):
@@ -574,9 +715,20 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
 
         See docs/MEMORY_ARCHITECTURE.md for design rationale.
         """
+        # §136: Pipeline agents don't need persistent memory.db
+        from core.agent_types import get_defaults
+        if not get_defaults(self._agent_type).memory_db:
+            self.logger.debug(f"[{self.agent_name}] Skipping memory_db init (agent_type={self._agent_type})")
+            return
+
         import sqlite3
         from core.skills.base import BaseSkill
-        db_path = BaseSkill.memory_db_path(self.agent_name)
+        try:
+            db_path = BaseSkill.memory_db_path(self.agent_name)
+        except PermissionError:
+            # Meta agent without project context yet — use default storage
+            db_path = Path("storage/agents") / self.agent_name / "memory.db"
+            db_path.parent.mkdir(parents=True, exist_ok=True)
         self._memory_db_path = db_path
         try:
             conn = sqlite3.connect(str(db_path), timeout=5)
@@ -695,7 +847,11 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _restore_history(self):
-        limit = self.config.get("history_limit", Config.HISTORY_LIMIT)
+        # §136: Type-aware history limit
+        from core.agent_types import get_config_value
+        limit = get_config_value(self.config, "history_limit", agent_type=getattr(self, '_agent_type', None))
+        if not limit:
+            limit = Config.HISTORY_LIMIT  # fallback
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT role, content FROM aimos_chat_histories "
@@ -708,7 +864,7 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
     # "internal" and "scheduled_job" are always included (agent relay + automated tasks).
     # Each connector family groups its variants (e.g. telegram + telegram_voice + telegram_doc).
     # New connectors just need to be added here as a set — no other code changes needed.
-    _ALWAYS_VISIBLE = {"internal", "scheduled_job"}
+    _ALWAYS_VISIBLE = {"internal", "internal_return", "scheduled_job"}
     _CONNECTOR_FAMILIES = [
         {"telegram", "telegram_voice", "telegram_doc"},
         {"email"},
@@ -984,8 +1140,23 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _parse_tool_calls(self, text: str) -> list[dict]:
-        """Parse tool calls from LLM output. Tries 4 strategies in order."""
+        """Parse tool calls from LLM output. Tries 5 strategies in order."""
         calls: list[dict] = []
+
+        # Strategy 0: Mistral native text format
+        # [TOOL_CALL]\nname:N<|tool_call_argument_begin|>{JSON}<|tool_call_end|>
+        _mistral_tc = re.findall(
+            r'\[TOOL_CALL\]\s*(\w+):\d+\s*<\|tool_call_argument_begin\|>\s*(\{[^}]*\})\s*<\|tool_call_end\|>',
+            text,
+        )
+        if _mistral_tc:
+            for name, args_str in _mistral_tc:
+                try:
+                    args = json.loads(args_str)
+                except json.JSONDecodeError:
+                    args = {}
+                calls.append({"name": name, "arguments": args})
+            return calls
 
         # Strategy 1: <tool_call>{JSON}</tool_call>
         for m in _TC_XML.finditer(text):
@@ -1084,6 +1255,11 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
 
         CR-114: Uses Ollama's native tool-calling API. Returns:
           {"content": "text", "tool_calls": [{"function": {"name": ..., "arguments": {...}}}]}
+
+        CR-283: If the agent config sets `llm_provider` to a hosted API
+        ("mistral" or "anthropic"), the call is dispatched through the
+        LLM router instead of Ollama. Backward compat: agents without
+        `llm_provider` still take the legacy Ollama path.
         """
         # Heartbeat before LLM call (prevents orchestrator from killing during inference)
         if self._pool and not self._pool._closed:
@@ -1093,6 +1269,59 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
                 )
             except Exception:
                 pass
+
+        # CR-283: Hosted-API path — dispatch to router and return early.
+        _provider = self.config.get("llm_provider")
+        if _provider:
+            try:
+                from core.llm import router as _llm_router
+                if _llm_router.is_api_provider(_provider):
+                    _model = self.config.get("llm_model") or self.config.get("model", "")
+                    _temp = self.config.get("temperature", Config.TEMPERATURE)
+                    _max_tok = int(self.config.get("llm_max_tokens", 4096))
+                    _fb = self.config.get("llm_fallback") or None
+                    _reason = self.config.get("llm_reasoning_effort") or None
+                    _rfmt = self.config.get("llm_response_format") or None
+                    _timeout = float(self.config.get("llm_timeout_s", 90.0))
+                    self._audit(
+                        "LLM_CALL",
+                        f"router={_provider}/{_model} msgs={len(messages)}"
+                    )
+                    result = await _llm_router.call(
+                        provider=_provider,
+                        model=_model,
+                        messages=messages,
+                        tools=tools,
+                        temperature=float(_temp),
+                        max_tokens=_max_tok,
+                        stop=STOP_SEQUENCES,
+                        timeout_s=_timeout,
+                        fallback=_fb,
+                        reasoning_effort=_reason,
+                        response_format=_rfmt,
+                    )
+                    in_t = result.get("in_tokens", 0)
+                    out_t = result.get("out_tokens", 0)
+                    cost = result.get("cost_usd", 0.0)
+                    self._audit(
+                        "LLM_USAGE",
+                        f"in={in_t} out={out_t} cost_usd={cost:.4f} "
+                        f"provider={result.get('provider')} model={result.get('model')}"
+                    )
+                    self.logger.info(
+                        f"[{self.agent_name}] LLM(api): {in_t}->{out_t} tokens "
+                        f"${cost:.4f} via {result.get('provider')}/{result.get('model')}"
+                    )
+                    return {
+                        "content": result.get("content", ""),
+                        "tool_calls": result.get("tool_calls", []),
+                    }
+            except Exception as exc:
+                self.logger.error(
+                    f"[{self.agent_name}] CR-283 router error ({_provider}): {exc}"
+                )
+                self._audit("LLM_ERROR", f"router_{_provider}: {exc}")
+                return {"content": f"[LLM Router Error: {exc}]", "tool_calls": []}
         num_ctx = self._vram_guard(self.config.get("num_ctx", Config.DEFAULT_NUM_CTX))
 
         # CR-127 + Dynamic Context Balancing: num_predict adapts to actual context usage
@@ -1549,6 +1778,41 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
             f"{len(self._history)} messages"
         )
 
+    @staticmethod
+    def _sanitize_context_block(block: str, label: str) -> str:
+        """§P1.3: Sanitize dynamic context against prompt injection.
+
+        Strips instruction-like patterns from memory/calendar/project/chat blocks
+        that could be used to override system rules via poisoned context.
+        """
+        if not block or not block.strip():
+            return block
+        lines = block.splitlines()
+        clean = []
+        _injection_re = re.compile(
+            r"</?(?:system|rules|immutable|instructions?|anweisungen?|system_core|emergency)",
+            re.IGNORECASE,
+        )
+        _override_re = re.compile(
+            r"(?:ignore\s+(?:all\s+)?previous|forget\s+(?:all\s+)?rules|"
+            r"you\s+are\s+now|du\s+bist\s+(?:jetzt|ab\s+sofort)\s+(?:ein|frei)|"
+            r"ignoriere\s+(?:alle\s+)?(?:vorherigen|bisherigen)|"
+            r"vergiss\s+(?:alle\s+)?regeln)",
+            re.IGNORECASE,
+        )
+        for line in lines:
+            stripped = line.strip()
+            if _injection_re.search(stripped):
+                continue  # Strip injected XML tags
+            if _override_re.search(stripped):
+                continue  # Strip override attempts
+            # Truncate individual entries to 500 chars
+            if len(stripped) > 500:
+                line = line[:500] + " [...]"
+            clean.append(line)
+        sanitized = "\n".join(clean)
+        return f"\n<dynamic_context type=\"{label}\">\n{sanitized}\n</dynamic_context>\n"
+
     async def think(self, user_message: str) -> str:
         """Full loop: user msg → LLM → tool calls → clean → answer.
 
@@ -1565,9 +1829,21 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
         tool_block = self._build_tool_block()
         ollama_tools = self._build_ollama_tools()
 
+        # single_call agents produce output directly, no tool use
+        if self.config.get("execution_strategy") == "single_call":
+            ollama_tools = []
+            tool_block = ""
+
+        # §118 tool_loop: ONE LLM call with ALL tools, no OODA phase filtering.
+        # The ReAct loop (line 1780+) handles tool_call → execute → repeat.
+        # This is for Klasse-B agents that need tool access without the
+        # overhead of 6 OODA phases (15-60s → 3-8s latency).
+        if self.config.get("execution_strategy") == "tool_loop":
+            # Keep all tools, skip phase filtering
+            pass  # ollama_tools already built, no filtering needed
+
         # CR-273: OODA Phase-based tool filtering for batch agents
-        ooda_phase = getattr(self, '_ooda_phase', None)
-        if ooda_phase is not None and ollama_tools:
+        elif (ooda_phase := getattr(self, '_ooda_phase', None)) is not None and ollama_tools:
             from core.tool_phase_registry import filter_tools_for_phase, PHASE_NAMES
             pre_count = len(ollama_tools)
             ollama_tools = filter_tools_for_phase(ollama_tools, ooda_phase)
@@ -1592,6 +1868,11 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
             project_block = get_project_context(self.agent_name)
         except Exception:
             pass
+        # §P1.3: Sanitize dynamic context blocks against prompt injection
+        memory_block = AIMOSAgent._sanitize_context_block(memory_block, "memory")
+        calendar_block = AIMOSAgent._sanitize_context_block(calendar_block, "calendar")
+        project_block = AIMOSAgent._sanitize_context_block(project_block, "projects")
+        chats_block = AIMOSAgent._sanitize_context_block(chats_block, "chats")
         # Build system prompt: Core → User prompt → Memory → Calendar → Projects → Active Chats
         system = self._CORE_SYSTEM_PROMPT + self._system_prompt + memory_block + calendar_block + project_block + chats_block
         # CR-248: Tool awareness in system prompt.
@@ -1638,6 +1919,13 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
                 pass  # Fallback to channel-filtered in-memory history
 
         messages = [{"role": "system", "content": system}] + thread_history
+
+        # Bug #19: Ensure current user_message is always in the messages list.
+        # When history_limit=0 (batch agents), the DB query returns empty and the
+        # in-memory history gets overwritten. The current prompt must still reach the LLM.
+        if not any(m.get("role") == "user" and m.get("content") == user_message for m in messages):
+            messages.append({"role": "user", "content": user_message})
+
         max_rounds = self.config.get("max_tool_rounds", Config.MAX_TOOL_ROUNDS)
 
         response_text = ""
@@ -1658,6 +1946,7 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
                     tool_calls.append({
                         "name": fn.get("name", ""),
                         "arguments": fn.get("arguments", {}),
+                        "id": tc.get("id", ""),  # Mistral requires tool_call_id in results
                     })
             else:
                 # Fallback: text-based parsing (for models without native tool support)
@@ -1679,7 +1968,12 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
                 self._touch()  # CR-166: keep watchdog alive during multi-tool chains
                 tool_results_this_cycle.append(str(result))  # CR-159
                 tool_msg = f"Tool '{tc.get('name')}' returned:\n{result}"
-                messages.append({"role": "tool", "content": tool_msg})
+                messages.append({
+                    "role": "tool",
+                    "content": tool_msg,
+                    "name": tc.get("name", "unknown"),
+                    "tool_call_id": tc.get("id", ""),
+                })
                 await self._persist_message("tool", tool_msg, {"tool": tc.get("name")})
                 # Terminal tools: after sending a message, stop the loop.
                 # Use the text from BEFORE the tool call as the final answer.
@@ -1693,30 +1987,65 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
                     self.logger.info(f"[{self.agent_name}] Terminal tool called — using pre-tool text as answer")
                     response_text = pre_tool_text
                 else:
-                    # LLM generated only the tool call with no text — do one more round
-                    # to let it generate a customer-facing response
                     self.logger.info(f"[{self.agent_name}] Terminal tool called but no text — one more LLM round")
-                    llm_final = await self._llm_chat(messages, tools=None)  # No tools → forces text
+                    llm_final = await self._llm_chat(messages, tools=None)
                     response_text = llm_final.get("content", "")
                 break
 
-        # CR-159: Confidence check (monitoring-only)
-        if any_tool_called:
+            # AP-C Fix: Non-terminal tools (read_file, system_scan, etc.) called
+            # but LLM generated no text alongside the tool call.
+            # Force one more LLM round WITHOUT tools to generate response from tool results.
+            if not pre_tool_text.strip():
+                self.logger.info(f"[{self.agent_name}] Non-terminal tool called, no text — forcing text generation from tool results")
+                llm_final = await self._llm_chat(messages, tools=None)
+                response_text = llm_final.get("content", "")
+                if response_text.strip():
+                    break  # Got meaningful text from tool results
+
+        # §136: Type-aware output processing
+        from core.agent_types import get_agent_type, get_defaults
+        _atype = getattr(self, '_agent_type', None) or get_agent_type(self.config)
+        _atdefaults = get_defaults(_atype)
+
+        # CR-159: Confidence check — skip for pipeline agents
+        if any_tool_called and _atdefaults.confidence_check:
             response_text = self._check_confidence(response_text, tool_results_this_cycle)
 
-        # Output-Firewall: mandatory clean step
+        # Output-Firewall: mandatory clean step (all types)
         for seq in STOP_SEQUENCES:
             response_text = response_text.replace(seq, "")
         answer = clean_llm_response(response_text, tool_was_called=any_tool_called)
 
-        # CR-114b: Phantom-action detection — only for reactive agents (Support, Chat)
-        # Batch agents (Steuerberater, FuSa) handle their own quality via system prompt
-        if self.config.get("execution_strategy") != "batch":
+        # CR-114b: Phantom-action detection — only for chatbot agents
+        if _atdefaults.phantom_actions:
             answer = await self._strip_phantom_actions(answer, tool_results_this_cycle)
 
-        # Loop detection: only for reactive agents (batch has history isolation)
-        if self.config.get("execution_strategy") != "batch":
+        # Loop detection — skip for pipeline agents (legitimately similar outputs)
+        if _atdefaults.loop_detection:
             answer = await self._check_loop_and_escalate(answer, user_message)
+
+        # §P1.1 Harness Output-Validation — prüft gegen Charter-Verbote + PII + Scope
+        answer, _violations = await self._validate_output(answer)
+        _critical = [v for v in _violations if v[0] == "CRITICAL"]
+        _high = [v for v in _violations if v[0] == "HIGH"]
+        if _critical and _atdefaults.output_blocking:
+            self._audit("OUTPUT_BLOCKED", json.dumps(
+                [{"severity": s, "type": t, "msg": m} for s, t, m in _critical],
+                ensure_ascii=False))
+            answer = self._get_safe_fallback(_critical)
+        elif _high and _atdefaults.output_blocking:
+            self._audit("OUTPUT_BLOCKED_HIGH", json.dumps(
+                [{"severity": s, "type": t, "msg": m} for s, t, m in _high],
+                ensure_ascii=False))
+            answer = self._get_safe_fallback(_high)
+
+        # §P1.2: Cross-Provider Self-Verification (kosten-gesteuert)
+        if (hasattr(_atdefaults, "self_verification") and _atdefaults.self_verification
+                and self._should_verify(answer, _violations)):
+            answer, _was_modified = await self._verify_with_cross_provider(
+                answer, user_message, _violations)
+            if _was_modified:
+                self._audit("SELF_VERIFY_MODIFIED", f"original_len={len(answer)}")
 
         await self._persist_message("assistant", answer)
         return answer
@@ -1749,7 +2078,7 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
             rows = await conn.fetch(
                 "UPDATE pending_messages SET processed=TRUE "
                 "WHERE agent_name=$1 AND processed=FALSE "
-                "RETURNING id, sender_id, content, kind",
+                "RETURNING id, sender_id, content, kind, project_id",
                 self.agent_name,
             )
 
@@ -1759,12 +2088,22 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
         self.logger.info(f"[{self.agent_name}] Draining {len(rows)} queued messages …")
         for row in rows:
             content = row["content"] or ""
+            # CR-286: same project-context handling as run_loop
+            _proj_token = None
+            _proj_id = row["project_id"] if "project_id" in row.keys() else None
+            if _proj_id:
+                from core.skills.base import set_active_project
+                _proj_token = set_active_project(_proj_id)
             try:
                 await asyncio.wait_for(self.think(content), timeout=_QUEUE_MSG_TIMEOUT)
             except asyncio.TimeoutError:
                 self.logger.warning(
                     f"[{self.agent_name}] Queue msg {row['id']} timed out after {_QUEUE_MSG_TIMEOUT}s"
                 )
+            finally:
+                if _proj_token is not None:
+                    from core.skills.base import clear_active_project
+                    clear_active_project(_proj_token)
         self.logger.info(f"[{self.agent_name}] Queue drained.")
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1772,8 +2111,360 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _touch(self):
-        """Update last-activity timestamp."""
-        self._last_activity = asyncio.get_event_loop().time()
+        """Update last-activity timestamp (in-process + DB heartbeat)."""
+        now = asyncio.get_event_loop().time()
+        self._last_activity = now
+        # §P2.0: DB-Heartbeat alle 30s updaten um Orchestrator-Kill zu verhindern.
+        # Ohne das wird der Agent bei langen LLM-Calls als "stale" erkannt.
+        if now - getattr(self, "_last_db_heartbeat", 0) > 30:
+            self._last_db_heartbeat = now
+            asyncio.ensure_future(self._db_heartbeat())
+
+    async def _db_heartbeat(self):
+        """§P2.0: DB-Heartbeat updaten damit Orchestrator den Agent nicht killt."""
+        try:
+            if self._pool:
+                async with self._pool.acquire(timeout=3) as conn:
+                    await conn.execute(
+                        "UPDATE agents SET updated_at=NOW() WHERE name=$1",
+                        self.agent_name,
+                    )
+        except Exception:
+            pass  # Non-critical — nächster Versuch in 30s
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  ADM Persist Wrapper (Sektion 98 / CR-287..289 wire-up)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _adm_persist_wrapper(self, msg: dict, think_success: bool, think_error: str | None, think_response: str | None = None) -> None:
+        """ADM Pipeline Persist Phase Wrapper.
+
+        Wird vom run_loop NACH think() für jede meta_agent_adm message mit
+        active project context aufgerufen. Orchestriert die Persist-Phase:
+        parse → postprocess → write → status → enqueue_downstream.
+
+        Pipeline-Vorrücken passiert AUSSCHLIESSLICH hier. Wenn dieser
+        Aufruf fehlt oder fehlschlägt, ist die Pipeline stuck.
+
+        Folgt strikt den STPA-Mitigations M-1 bis M-26 aus
+        docs/projects/adm_autopilot/STPA_2026-04-09.md Schritt 4.
+
+        Args:
+            msg: dict aus pending_messages mit project_id und target_agent
+            think_success: True wenn think() ohne Exception zurückkehrte
+            think_error: Exception-string wenn think() fehlschlug, sonst None
+        """
+        from core.skills.base import _load_agent_meta, _is_meta_agent, enqueue_downstream
+
+        project_id = msg.get("project_id", "").strip() if isinstance(msg.get("project_id"), str) else None
+        target_agent = self._extract_target_agent_from_msg(msg)
+        msg_id = msg.get("id")
+
+        # STPA M-5: distinguish „nicht meta" vs „meta load error"
+        try:
+            meta = _load_agent_meta(self.agent_name)
+        except Exception as exc:
+            self.logger.error(f"[{self.agent_name}] persist wrapper: meta load failed: {exc}")
+            self._safe_append_status(
+                phase=self._phase_for_agent(),
+                state="failed",
+                note=f"meta load: {exc}",
+            )
+            return
+
+        if not _is_meta_agent(meta):
+            # non-meta agent processed an ADM-style message — that's a config bug
+            self.logger.warning(
+                f"[{self.agent_name}] persist wrapper called for non-meta agent with project_id={project_id} — skipping persist"
+            )
+            return
+
+        # Some pipeline agents (e.g. fab4v_tuner, fab1v_release_verify) ignore
+        # raw_llm_response entirely — their persist.py runs subprocess work that
+        # doesn't depend on the LLM output. For those, persist must run even
+        # when think() failed.
+        _persist_independent_early = (
+            self.agent_name.endswith("_tuner")
+            or "_verify" in self.agent_name
+            or "validation" in self.agent_name
+            or "_acceptance_test" in self.agent_name
+            or "_release" in self.agent_name
+            or "_operations" in self.agent_name
+            # §125-8: fab5a runs deterministic implementation safety checks
+            # in persist that must fire even if think() failed (e.g. Mistral
+            # content_filter on privacy-leak / hallucination prompts).
+            or "_safety_designer" in self.agent_name
+            # §130 Phase 2: fab2t_design_test_bridge + fab3t_module_test_bridge
+            # are subprocess-driven (deterministic check) — their LLM call is
+            # only a smoke confirmation. Persist must run on think() failure.
+            or "_test_bridge" in self.agent_name
+            # §126/D fab2a_acceptance_designer is subprocess-driven (deterministic
+            # generator script). Same pattern.
+            or "_acceptance_designer" in self.agent_name
+        )
+
+        # STPA M-3 + U-E.1: persist NUR nach erfolgreichem think
+        # (Ausnahme: subprocess-driven Agenten)
+        if not think_success and not _persist_independent_early:
+            self.logger.warning(
+                f"[{self.agent_name}] think() failed, skipping persist (msg_id={msg_id})"
+            )
+            self._safe_append_status(
+                phase=self._phase_for_agent(),
+                state="failed",
+                note=f"think exception: {think_error or 'unknown'}",
+            )
+            return
+
+        if not think_success and _persist_independent_early:
+            self.logger.info(
+                f"[{self.agent_name}] think() failed but persist is subprocess-driven — running persist anyway"
+            )
+
+        # STPA M-6 + U-E.2: persist.py existence + import check
+        persist_mod = self._load_persist_module()
+        if persist_mod is None:
+            self.logger.error(
+                f"[{self.agent_name}] persist.py not found or unloadable — pipeline stuck"
+            )
+            self._safe_append_status(
+                phase=self._phase_for_agent(),
+                state="failed",
+                note=f"no persist.py for {self.agent_name}",
+            )
+            return
+
+        # Use the response captured directly from think() return
+        raw_response = think_response or ""
+
+        # Some pipeline agents (e.g. fab4v_tuner, fab1v_release_verify) ignore
+        # raw_llm_response entirely — their persist.py runs subprocess work that
+        # doesn't depend on the LLM output. For those, persist must run even
+        # when think() returned nothing useful.
+        # Marker: agent name ends with "_tuner" or contains "subprocess" hint.
+        # §138: Use agent_type instead of name-matching
+        from core.agent_types import get_agent_type
+        _persist_independent = get_agent_type(self.config) == "pipeline"
+
+        if not _persist_independent and (not raw_response or len(raw_response.strip()) < 50):
+            # STPA U-E.1 CS-E.1.2: minimum content check
+            self.logger.warning(
+                f"[{self.agent_name}] think() returned implausibly short response ({len(raw_response or '')} chars) — treating as failure"
+            )
+            self._safe_append_status(
+                phase=self._phase_for_agent(),
+                state="failed",
+                note=f"think output too short: {len(raw_response or '')} chars",
+            )
+            return
+
+        if _persist_independent and (not raw_response or len(raw_response.strip()) < 50):
+            self.logger.info(
+                f"[{self.agent_name}] think() short ({len(raw_response or '')} chars) "
+                f"but persist is subprocess-driven — running persist anyway"
+            )
+
+        # STPA M-4: strikt sequenziell, persist in eigenem try
+        result = None
+        try:
+            from pathlib import Path
+            import inspect
+            REPO = Path(__file__).resolve().parent.parent
+            result = persist_mod.persist(
+                project_id=project_id,
+                target_agent=target_agent,
+                raw_llm_response=raw_response,
+                repo_root=REPO,
+            )
+            # Support async persist() — e.g. adm3 multi-call needs await
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            self.logger.error(
+                f"[{self.agent_name}] persist() raised exception: {exc}"
+            )
+            import traceback as _tb
+            self.logger.debug(_tb.format_exc())
+            self._safe_append_status(
+                phase=self._phase_for_agent(),
+                state="failed",
+                note=f"persist exception: {exc}",
+            )
+            return
+
+        if not isinstance(result, dict):
+            self._safe_append_status(
+                phase=self._phase_for_agent(),
+                state="failed",
+                note=f"persist returned {type(result).__name__}, expected dict",
+            )
+            return
+
+        # STPA M-7 + U-G.2: append_status IMMER, success oder failure
+        success = bool(result.get("success", False))
+        artifacts = result.get("artifacts", []) or []
+        errors = result.get("errors", []) or []
+        next_content = result.get("next_content")
+        phase_for_status = result.get("phase_for_status", self._phase_for_agent())
+
+        try:
+            from pathlib import Path
+            REPO_ROOT = Path(__file__).resolve().parent.parent
+            artifact_strs = [
+                str(p.relative_to(REPO_ROOT)) if hasattr(p, "relative_to") else str(p)
+                for p in artifacts
+            ]
+        except Exception:
+            artifact_strs = [str(p) for p in artifacts]
+
+        self._safe_append_status(
+            phase=phase_for_status,
+            state="done" if success else "failed",
+            note="; ".join(errors)[:200] if errors else "",
+            artifacts=artifact_strs,
+        )
+
+        # STPA M-8 + U-H.1, U-H.2: enqueue NUR nach success UND non-null next_content
+        if not success:
+            self.logger.info(
+                f"[{self.agent_name}] persist failed, NOT enqueuing downstream (msg_id={msg_id})"
+            )
+            return
+
+        if not next_content:
+            self.logger.info(
+                f"[{self.agent_name}] persist success, no next_content — pipeline endpoint reached"
+            )
+            return
+
+        # STPA M-8 + U-H.3: enqueue mit Idempotenz (im Helper)
+        try:
+            new_id = enqueue_downstream(
+                from_agent=self.agent_name,
+                content=next_content,
+                parent_msg_id=msg_id,
+                project_id=project_id,
+                target_agent=target_agent,
+            )
+            if new_id is not None:
+                self.logger.info(
+                    f"[{self.agent_name}] enqueued downstream msg #{new_id} for next phase"
+                )
+            else:
+                self.logger.info(
+                    f"[{self.agent_name}] enqueue_downstream returned None (no downstream_agent or already exists)"
+                )
+        except Exception as exc:
+            self.logger.error(
+                f"[{self.agent_name}] enqueue_downstream raised: {exc}"
+            )
+            self._safe_append_status(
+                phase=phase_for_status,
+                state="failed",
+                note=f"enqueue: {exc}",
+            )
+
+    def _safe_append_status(self, phase: str, state: str, note: str = "", artifacts: list[str] | None = None) -> None:
+        """append_status mit eigenem try/except, niemals propagating exceptions."""
+        from core.skills.base import BaseSkill
+        try:
+            BaseSkill.append_status(
+                self.agent_name,
+                phase=phase,
+                state=state,
+                note=note,
+                artifacts=artifacts or [],
+            )
+        except Exception as exc:
+            self.logger.error(
+                f"[{self.agent_name}] append_status failed (non-fatal): {exc}"
+            )
+
+    def _load_persist_module(self):
+        """Lazy-load persist.py for this agent via importlib.
+
+        Lookup order: fabrik/fab/<agent>/persist.py → fabrik/adm/<agent>/persist.py
+        → templates/<agent>/persist.py.
+        Cache pro process. Returns None if file doesn't exist or import fails.
+        """
+        cache_attr = "_persist_module_cache"
+        if not hasattr(self, cache_attr):
+            setattr(self, cache_attr, None)
+            from pathlib import Path
+            REPO = Path(__file__).resolve().parent.parent
+            # §121: Try fab/ first (V-Modell naming), then adm/ (legacy)
+            persist_path = REPO / "fabrik" / "fab" / self.agent_name / "persist.py"
+            if not persist_path.exists():
+                persist_path = REPO / "fabrik" / "adm" / self.agent_name / "persist.py"
+            if not persist_path.exists():
+                persist_path = REPO / "templates" / self.agent_name / "persist.py"
+            if persist_path.exists():
+                try:
+                    import importlib.util
+                    spec = importlib.util.spec_from_file_location(
+                        f"_persist_{self.agent_name}", persist_path
+                    )
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    setattr(self, cache_attr, mod)
+                except Exception as exc:
+                    self.logger.error(
+                        f"[{self.agent_name}] persist.py load failed: {exc}"
+                    )
+        return getattr(self, cache_attr)
+
+    def _get_last_assistant_message(self) -> str | None:
+        """Holt den raw content der letzten 'assistant'-Zeile aus chat_histories."""
+        try:
+            import sqlite3
+            # Synchronous DB access — chat history is per-agent SQLite
+            # Note: this uses asyncpg pool for the postgres aimos_chat_histories
+            # but for simplicity we use a sync approach here. Production should
+            # cache the last assistant turn in self._last_response_content.
+            return getattr(self, "_last_assistant_content", None)
+        except Exception:
+            return None
+
+    def _extract_target_agent_from_msg(self, msg: dict) -> str | None:
+        """STPA M-1: extract target_agent from msg dict.
+
+        v1: liest die `target_agent`-Spalte direkt (DB-Migration in 98.2).
+        Fallback: parse aus content (legacy bootstrap-Skripte schreiben es
+        als Zeile `TARGET_AGENT: <name>` in die content).
+        """
+        # Primary: dedicated column
+        target = msg.get("target_agent")
+        if target and isinstance(target, str) and target.strip():
+            return target.strip()
+
+        # Fallback: parse from content
+        content = msg.get("content", "") or ""
+        import re
+        m = re.search(r"^TARGET_AGENT:\s*(\S+)", content, re.MULTILINE)
+        if m:
+            return m.group(1).strip()
+        m = re.search(r"Ziel-Agent[^']*'([^']+)'", content)
+        if m:
+            return m.group(1).strip()
+        return None
+
+    def _phase_for_agent(self) -> str:
+        """Defaultname der Phase für append_status, falls persist nichts liefert."""
+        # Heuristic mapping based on agent name
+        name = self.agent_name
+        if name.startswith("adm2"): return "ADM.2"
+        if name.startswith("adm3"): return "ADM.3"
+        if name.startswith("adm4_implementation") or name.startswith("adm4a"): return "ADM.4"
+        if name.startswith("adm4b"): return "ADM.4"
+        if name.startswith("adm4c"): return "ADM.4"
+        if name.startswith("adm4d"): return "ADM.4"
+        if name.startswith("adm5"): return "ADM.5"
+        if name.startswith("adm6"): return "ADM.6"
+        if name.startswith("adm7"): return "ADM.7"
+        if name.startswith("adm8"): return "ADM.8"
+        if name.startswith("man1"): return "MAN.1"
+        if name.startswith("adm1"): return "ADM.1"
+        return "UNKNOWN"
 
     async def _watchdog(self):
         """Background task: shut down if idle for >90s without messages.
@@ -1847,16 +2538,18 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
                     "UPDATE pending_messages SET processed=TRUE "
                     "WHERE LOWER(agent_name)=$1 AND processed=FALSE "
                     "AND kind NOT LIKE 'outbound_%' "
-                    "RETURNING id, sender_id, content, kind, file_path, created_at, thread_id",
-                    self.agent_name,
+                    "AND tenant_id=$2 "  # §H22: dispatch only same-tenant
+                    "RETURNING id, sender_id, content, kind, file_path, created_at, "
+                    "thread_id, project_id, target_agent, tenant_id, loop_depth, cost_cents",
+                    self.agent_name, self._tenant_id,
                 )
         except (asyncio.TimeoutError, asyncpg.InterfaceError) as exc:
             self.logger.warning(f"[{self.agent_name}] poll_pending DB error: {exc} — retrying next cycle")
             return []
         if rows:
-            # CR-206b: Wait briefly for more messages (natural chat = burst of voice + photo + text)
-            # Configurable per agent: voice=0, reactive=3 (default), batch=0 (collects all anyway)
-            burst_wait = self.config.get("burst_wait", 0 if self.config.get("execution_strategy") == "batch" else 3)
+            # §136: Type-aware burst_wait (chatbot=3s, pipeline/product=0s)
+            from core.agent_types import get_config_value
+            burst_wait = get_config_value(self.config, "burst_wait", agent_type=getattr(self, '_agent_type', None))
             if burst_wait > 0:
                 await asyncio.sleep(burst_wait)
             try:
@@ -1865,8 +2558,10 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
                         "UPDATE pending_messages SET processed=TRUE "
                         "WHERE LOWER(agent_name)=$1 AND processed=FALSE "
                         "AND kind NOT LIKE 'outbound_%' "
-                        "RETURNING id, sender_id, content, kind, file_path, created_at, thread_id",
-                        self.agent_name,
+                        "AND tenant_id=$2 "  # §H22
+                        "RETURNING id, sender_id, content, kind, file_path, created_at, "
+                        "thread_id, project_id, target_agent, tenant_id, loop_depth, cost_cents",
+                        self.agent_name, self._tenant_id,
                     )
                 if late_rows:
                     rows = list(rows) + list(late_rows)
@@ -1932,7 +2627,78 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
                         f"[{self.agent_name}] Processing [{msg.get('kind')}] "
                         f"from {msg.get('sender_id')}: {content[:80]}"
                     )
-                    await self.think(content)
+                    # CR-286: Set per-cycle project context (ContextVar) so
+                    # CR-285 workspace_path / enforce_io_scope route the agent
+                    # into the correct project folder. NULL/empty for classic
+                    # (non-pipeline) messages — the ContextVar stays unset.
+                    #
+                    # STPA M-1, M-2: defensive guard against empty strings
+                    # STPA U-C.4: leerer String darf nicht durchgehen
+                    _proj_token = None
+                    _proj_id_raw = msg.get("project_id")
+                    _proj_id = _proj_id_raw.strip() if isinstance(_proj_id_raw, str) and _proj_id_raw.strip() else None
+                    if _proj_id:
+                        from core.skills.base import set_active_project
+                        _proj_token = set_active_project(_proj_id)
+                        self.logger.info(
+                            f"[{self.agent_name}] [CR-286] active project: {_proj_id} (msg id={msg.get('id')})"
+                        )
+
+                    # STPA M-3: track think() success for the wrapper
+                    _think_success = False
+                    _think_error = None
+                    _think_response = None
+
+                    # §133 Perf-1 + §138: Skip think() for SUBPROCESS-DRIVEN
+                    # pipeline agents only. LLM-producing agents (fab2_requirements,
+                    # fab3_design, fab4_implementation) NEED think() to generate output.
+                    # Subprocess-driven agents (fab4v, fab5a, fab3v, fab5v etc.)
+                    # ignore raw_llm_response — their persist.py does the work.
+                    _LLM_PRODUCING_AGENTS = {
+                        "fab2_requirements",
+                    }
+                    from core.agent_types import get_agent_type
+                    _is_pipeline = get_agent_type(self.config) == "pipeline"
+                    _skip_think = _is_pipeline and self.agent_name not in _LLM_PRODUCING_AGENTS
+
+                    try:
+                        if _skip_think:
+                            self.logger.info(
+                                f"[{self.agent_name}] §133 Perf-1: skipping think() — persist is subprocess-driven"
+                            )
+                            _think_success = True
+                            _think_response = ""
+                        else:
+                            try:
+                                _think_response = await self.think(content)
+                                _think_success = True
+                            except Exception as exc:
+                                _think_error = str(exc)
+                                self.logger.error(
+                                    f"[{self.agent_name}] think() exception: {exc}"
+                                )
+
+                        # CR-287..289 ADM persist phase wrapper (Sektion 98)
+                        # — only fires for meta_agent_adm with active project context.
+                        # See docs/ADM/PERSIST_PHASE_PATTERN.md and STPA M-1..M-26.
+                        if _proj_id:
+                            await self._adm_persist_wrapper(
+                                msg=msg,
+                                think_success=_think_success,
+                                think_error=_think_error,
+                                think_response=_think_response,
+                            )
+                    finally:
+                        # STPA M-26: clear_active_project ALWAYS, even if persist
+                        # wrapper itself crashes. Outer try/finally for ContextVar.
+                        if _proj_token is not None:
+                            from core.skills.base import clear_active_project
+                            try:
+                                clear_active_project(_proj_token)
+                            except Exception as exc:
+                                self.logger.error(
+                                    f"[{self.agent_name}] clear_active_project failed: {exc}"
+                                )
                     self._touch()
 
                 # Check wake_up_needed flag (CR-138: timeout protection)

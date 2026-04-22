@@ -130,6 +130,17 @@ _spawn_backoff: dict[str, float] = {}  # agent_name → next allowed spawn time 
 _spawn_times: dict[str, float] = {}    # agent_name → last spawn time (monotonic)
 _BACKOFF_STEPS = [30, 60, 300]  # seconds: escalating backoff after >3 failures
 
+# CR-284: Compute Class — distinguish GPU-bound from API-only agents.
+# Default for missing/invalid config is "local_gpu" (backward-compatible).
+# Concurrency Analysis (2026-04-09): API agents are I/O-bound (waiting for
+# HTTP responses), so many can run in parallel. Limits:
+#   - DB Pool (10) → ~8 agents safely
+#   - Mistral API rate limit → ~5 concurrent requests safe
+#   - Conservative: 5 (enough for pipeline + 2 customer agents parallel)
+MAX_CONCURRENT_API_AGENTS = int(os.getenv("MAX_CONCURRENT_API_AGENTS", "5"))
+_VALID_COMPUTE_CLASSES = {"local_gpu", "api_only", "mixed"}
+_compute_class_cache: dict[str, str] = {}  # invalidated each cycle in main loop
+
 
 # ── DB ────────────────────────────────────────────────────────────────────────
 
@@ -221,6 +232,57 @@ def _get_agents_with_pending() -> list[str]:
         return []
 
 
+def _get_compute_class(name: str) -> str:
+    """CR-284: Return the agent's compute class.
+
+    Reads `agents.config.compute_class` from the DB. Defaults to "local_gpu"
+    for missing or invalid values, which preserves the pre-CR-284 behavior
+    (one GPU-bound agent at a time).
+
+    Cached per cycle via `_compute_class_cache` to avoid DB hit storms; the
+    cache is cleared at the top of the main loop.
+    """
+    if name in _compute_class_cache:
+        return _compute_class_cache[name]
+    cclass = "local_gpu"  # defensive default
+    try:
+        c = _db()
+        with c.cursor() as cur:
+            cur.execute("SELECT config FROM agents WHERE name=%s", (name,))
+            row = cur.fetchone()
+        c.close()
+        if row:
+            cfg = row["config"]
+            if isinstance(cfg, str):
+                cfg = json.loads(cfg)
+            if isinstance(cfg, dict):
+                raw = cfg.get("compute_class")
+                if isinstance(raw, str) and raw in _VALID_COMPUTE_CLASSES:
+                    cclass = raw
+    except Exception as exc:
+        log.debug(f"[CR-284] _get_compute_class('{name}') fallback: {exc}")
+    _compute_class_cache[name] = cclass
+    return cclass
+
+
+def _split_running_by_class() -> tuple[list[str], list[str]]:
+    """CR-284: Return (local_gpu_running, api_only_running) names from `_agents`.
+
+    `mixed` agents are counted as `local_gpu` for exclusivity purposes (they may
+    grab the GPU at any time, so they must not collide with another GPU agent).
+    """
+    local_gpu, api_only = [], []
+    for n in list(_agents):
+        if not _is_running(n):
+            continue
+        cclass = _get_compute_class(n)
+        if cclass == "api_only":
+            api_only.append(n)
+        else:
+            local_gpu.append(n)
+    return local_gpu, api_only
+
+
 def _set_status(name: str, status: str, pid: int = None):
     try:
         c = _db()
@@ -275,12 +337,26 @@ def _spawn(name: str):
         log.warning(f"[CR-187] '{name}' in spawn backoff ({remaining}s remaining) — skipping")
         return
 
-    # CR-164 simplified: Only one agent at a time — check in-memory state
-    # The orchestrator is the only process that spawns agents, so _agents dict is authoritative
-    running = [n for n in _agents if _is_running(n)]
-    if running:
-        log.info(f"[CR-164] Agent '{running[0]}' is running — skipping spawn of '{name}'")
-        return
+    # CR-284: Compute-class-aware exclusivity.
+    # local_gpu / mixed: max one GPU-bound agent at a time (CR-164 semantics).
+    # api_only: no exclusivity, only the global MAX_CONCURRENT_API_AGENTS cap.
+    cclass = _get_compute_class(name)
+    local_gpu_running, api_only_running = _split_running_by_class()
+    if cclass == "api_only":
+        if len(api_only_running) >= MAX_CONCURRENT_API_AGENTS:
+            log.info(
+                f"[CR-284] api_only cap reached ({len(api_only_running)}/"
+                f"{MAX_CONCURRENT_API_AGENTS}) — skipping spawn of '{name}'"
+            )
+            return
+    else:
+        # local_gpu or mixed
+        if local_gpu_running:
+            log.info(
+                f"[CR-164] GPU agent '{local_gpu_running[0]}' is running — "
+                f"skipping spawn of '{name}'"
+            )
+            return
 
     # Clean stale PID file before spawn (prevents singleton abort)
     Path(f"/tmp/aimos_agent_{name}.pid").unlink(missing_ok=True)
@@ -384,6 +460,24 @@ def _stop(name: str):
     _set_status(name, "offline")
 
 
+def _check_restart_flags():
+    """§172 Int.2: Check for agent restart flags after skill deployment.
+
+    When an agent deploys a new skill via SWEAiderSkill, it writes a flag file
+    tmp/restart_<agent>.flag. The orchestrator picks it up, stops the agent,
+    and lets the normal spawn-on-pending logic restart it with the new skill.
+    """
+    flag_dir = Path("tmp")
+    if not flag_dir.exists():
+        return
+    for flag in flag_dir.glob("restart_*.flag"):
+        agent_name = flag.stem.replace("restart_", "")
+        if agent_name in _agents:
+            log.info(f"[§172] Restart flag for '{agent_name}' — stopping for skill reload")
+            _stop(agent_name)
+        flag.unlink(missing_ok=True)
+
+
 def _stop_all():
     """Stop all tracked agents."""
     for name in list(_agents):
@@ -398,7 +492,7 @@ def _heal_zombies():
         c = _db()
         with c.cursor() as cur:
             # 1. Agents marked active but no live process → offline
-            cur.execute("SELECT name, updated_at FROM agents WHERE status IN ('active','running','idle','starting')")
+            cur.execute("SELECT name, updated_at, config FROM agents WHERE status IN ('active','running','idle','starting')")
             db_active = cur.fetchall()
             for row in db_active:
                 name = row["name"]
@@ -429,7 +523,23 @@ def _heal_zombies():
                 if row["updated_at"]:
                     from datetime import datetime, timezone
                     age = (datetime.now(timezone.utc) - row["updated_at"].replace(tzinfo=timezone.utc)).total_seconds()
-                    if age > 180 and name in _agents:
+                    # §136: Type-aware heartbeat timeout
+                    _hb_timeout = 180
+                    try:
+                        _cfg = row.get("config") or {}
+                        if isinstance(_cfg, str):
+                            import json as _hb_json
+                            _cfg = _hb_json.loads(_cfg)
+                        from core.agent_types import get_agent_type, get_defaults
+                        _cfg["name"] = name
+                        _atype = get_agent_type(_cfg)
+                        _hb_timeout = int(_cfg.get("heartbeat_timeout", get_defaults(_atype).heartbeat_timeout))
+                        # api_only agents still get elevated timeout as minimum
+                        if _cfg.get("compute_class") == "api_only":
+                            _hb_timeout = max(_hb_timeout, 600)
+                    except Exception:
+                        pass
+                    if age > _hb_timeout and name in _agents:
                         proc = _agents[name]
                         log.error(f"STALE HEARTBEAT: '{name}' last heartbeat {age:.0f}s ago — killing PID={proc.pid}")
                         _stop(name)
@@ -495,7 +605,7 @@ def _daily_wakeup():
             agents = [r["name"] for r in cur.fetchall()]
 
             for name in agents:
-                # Skip agents with disable_auto_jobs — no point waking them
+                # §136: Skip agents whose type doesn't support daily wakeup
                 cur.execute(
                     "SELECT config FROM agents WHERE name=%s", (name,)
                 )
@@ -505,6 +615,10 @@ def _daily_wakeup():
                     try:
                         cfg = _json.loads(row["config"]) if isinstance(row["config"], str) else row["config"]
                         if cfg.get("disable_auto_jobs"):
+                            continue
+                        from core.agent_types import get_agent_type, get_defaults
+                        cfg["name"] = name
+                        if not get_defaults(get_agent_type(cfg)).daily_wakeup:
                             continue
                     except Exception:
                         pass
@@ -656,6 +770,28 @@ def _dream_check():
     msg_counts = {row["agent_name"]: row["msg_count"] for row in count_rows}
 
     for name in all_agents:
+        # §136: Type-aware dreaming — only chatbot agents dream
+        try:
+            c3 = _db()
+            with c3.cursor() as cur3:
+                cur3.execute("SELECT config FROM agents WHERE name=%s", (name,))
+                _arow = cur3.fetchone()
+                _acfg = {}
+                if _arow:
+                    _acfg = _arow["config"]
+                    if isinstance(_acfg, str):
+                        import json as _json_d
+                        _acfg = _json_d.loads(_acfg)
+            c3.close()
+        except Exception:
+            _acfg = {}
+
+        from core.agent_types import get_agent_type, get_defaults
+        _acfg["name"] = name
+        _atype = get_agent_type(_acfg)
+        if not get_defaults(_atype).dreaming:
+            continue
+
         msg_count = msg_counts.get(name, 0)
 
         # Only dream if there's enough history to process
@@ -833,6 +969,8 @@ async def run(once: bool = False):
     try:
         while not shutdown.is_set():
             cycle += 1
+            # CR-284: invalidate compute_class cache at the start of every cycle
+            _compute_class_cache.clear()
             try:
                 enabled = _is_enabled()
             except Exception:
@@ -887,6 +1025,7 @@ async def run(once: bool = False):
             # Self-heal every 5 cycles (~10s)
             if cycle % 5 == 0:
                 _heal_zombies()
+                _check_restart_flags()  # §172 Int.2: skill deployment restarts
 
             # Job Runner (CR-063): fire due scheduled jobs every 10 cycles (~20s)
             if cycle % 10 == 0:
@@ -903,7 +1042,16 @@ async def run(once: bool = False):
                 _dream_check()
 
             # CR-215d: Ollama health check every 60 cycles (~120s)
-            if cycle % 60 == 0:
+            # Skip on cloud-only servers (no Ollama container running)
+            _ollama_check = cycle % 60 == 0 and "disabled" not in Config.LLM_MODEL
+            if _ollama_check:
+                # Quick pre-check: don't bother if port 11434 isn't listening
+                import socket as _ohc_sock
+                _s = _ohc_sock.socket(_ohc_sock.AF_INET, _ohc_sock.SOCK_STREAM)
+                _s.settimeout(1)
+                _ollama_check = _s.connect_ex(("127.0.0.1", 11434)) == 0
+                _s.close()
+            if _ollama_check:
                 try:
                     import urllib.request
                     req = urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=5)
@@ -959,9 +1107,8 @@ async def run(once: bool = False):
                 except Exception:
                     pass
 
-            # CR-137: Process-level watchdog — kill agents that hang (alive but unresponsive)
-            # Checks every 30 cycles (~60s): if agent PID has 0% CPU for 2 consecutive checks
-            # AND its DB updated_at is stale (>5 min), it's hanging → kill it
+            # CR-137 + §136: Process-level watchdog — kill agents that hang
+            # Type-aware: pipeline agents get longer grace period (LLM calls take 30-120s)
             if cycle % 30 == 0:
                 for name in list(_agents):
                     proc = _agents.get(name)
@@ -974,15 +1121,27 @@ async def run(once: bool = False):
                         c = _db()
                         with c.cursor() as cur:
                             cur.execute(
-                                "SELECT updated_at FROM agents WHERE name=%s", (name,)
+                                "SELECT config, updated_at FROM agents WHERE name=%s", (name,)
                             )
                             row = cur.fetchone()
                         c.close()
                         if row and row["updated_at"]:
                             from datetime import datetime, timezone
                             age_sec = (datetime.now(timezone.utc) - row["updated_at"]).total_seconds()
-                            # Hanging: 0% CPU + no DB heartbeat for 5 minutes
-                            if cpu < 0.1 and age_sec > 300:
+                            # §136: Type-aware watchdog threshold
+                            _wd_threshold = 300  # default 5 min
+                            try:
+                                from core.agent_types import get_agent_type, get_defaults
+                                _wcfg = row.get("config") or {}
+                                if isinstance(_wcfg, str):
+                                    import json as _wd_json
+                                    _wcfg = _wd_json.loads(_wcfg)
+                                _wcfg["name"] = name
+                                _wd_threshold = get_defaults(get_agent_type(_wcfg)).heartbeat_timeout
+                            except Exception:
+                                pass
+                            # Hanging: 0% CPU + no heartbeat for type-specific threshold
+                            if cpu < 0.1 and age_sec > _wd_threshold:
                                 log.warning(
                                     f"[CR-137] '{name}' PID={proc.pid} appears hung "
                                     f"(CPU={cpu}%, last heartbeat {age_sec:.0f}s ago) → killing"
@@ -1008,20 +1167,28 @@ async def run(once: bool = False):
             if pending_agents:
                 log.info(f"[cycle {cycle}] Queue: {', '.join(pending_agents)}")
 
-            # VRAM Guard: enforce max ONE agent running in auto-mode
-            running_agents = [n for n in list(_agents) if _is_running(n)]
-            if len(running_agents) > 1:
-                # Kill all except the first — should never happen, but self-heal
-                for extra in running_agents[1:]:
-                    log.warning(f"[cycle {cycle}] VRAM Guard: killing extra agent '{extra}'")
+            # CR-284: Compute-class-aware running set.
+            # local_gpu / mixed agents are still serialized (max 1). api_only agents
+            # may run in parallel up to MAX_CONCURRENT_API_AGENTS.
+            local_gpu_running, api_only_running = _split_running_by_class()
+
+            # VRAM Guard: only enforce single-instance for GPU-bound agents.
+            # api_only agents are unaffected (no GPU contention).
+            if len(local_gpu_running) > 1:
+                for extra in local_gpu_running[1:]:
+                    log.warning(f"[cycle {cycle}] VRAM Guard: killing extra GPU agent '{extra}'")
                     _stop(extra)
                 await asyncio.sleep(2)
-            if running_agents:
-                # Smart-Yield (CR-072): if the running agent is idle AND other
-                # agents have pending messages, stop it to free the VRAM slot.
-                if pending_agents and len(running_agents) == 1:
-                    occupant = running_agents[0]
-                    waiting = [a for a in pending_agents if a != occupant]
+                local_gpu_running, api_only_running = _split_running_by_class()
+
+            # Smart-Yield (CR-072): only relevant between GPU agents. An idle GPU
+            # agent yields to a GPU waiter; api_only agents are neither yielders
+            # nor waiters in this logic.
+            gpu_pending = [a for a in pending_agents if _get_compute_class(a) != "api_only"]
+            if local_gpu_running and gpu_pending:
+                if len(local_gpu_running) == 1:
+                    occupant = local_gpu_running[0]
+                    waiting = [a for a in gpu_pending if a != occupant]
                     if waiting:
                         try:
                             c = _db()
@@ -1032,7 +1199,7 @@ async def run(once: bool = False):
                             occ_status = row["status"] if row else "unknown"
                         except Exception:
                             occ_status = "unknown"
-                        # Also check heartbeat — if stale >60s, agent is de facto idle
+                        # Heartbeat stale check
                         heartbeat_stale = False
                         try:
                             c2 = _db()
@@ -1071,21 +1238,44 @@ async def run(once: bool = False):
                             )
                             _stop(occupant)
                             await asyncio.sleep(2)
-                            continue  # next cycle will spawn the waiting agent
-                await asyncio.sleep(_POLL_INTERVAL)
-                continue
+                            local_gpu_running, api_only_running = _split_running_by_class()
+                            # Note: NOT continuing — we still want to dispatch api_only this cycle.
 
-            # Spawn the FIRST pending agent (one at a time)
+            # Proactive cleanup: reap all dead processes from _agents
+            # before computing spawn budget. Fixes the "Queue but no spawn"
+            # bug where dead processes block the concurrent agent limit.
+            for _cleanup_name in list(_agents):
+                _is_running(_cleanup_name)  # side-effect: pops dead from _agents
+
+            # CR-284: Spawn loop dispatches by compute class.
+            # - At most one local_gpu agent if none is currently running.
+            # - Up to MAX_CONCURRENT_API_AGENTS api_only agents in this cycle.
+            local_gpu_spawned_this_cycle = False
+            # Recompute after cleanup
+            local_gpu_running, api_only_running = _split_running_by_class()
+            api_spawn_budget = max(0, MAX_CONCURRENT_API_AGENTS - len(api_only_running))
             for name in pending_agents:
                 if _is_running(name):
+                    if cycle % 30 == 0:
+                        proc = _agents.get(name)
+                        log.debug(f"[DEBUG] '{name}' _is_running=True, PID={proc.pid if proc else '?'}, budget={api_spawn_budget}")
                     continue
 
                 # Cooldown check: rate-limited agents are locked out for 5 minutes
                 if _is_cooled_down(name):
                     remaining = int(_cooldown_until.get(name, 0) - time.monotonic())
-                    if cycle % 15 == 0:  # log periodically, not every cycle
+                    if cycle % 15 == 0:
                         log.warning(f"[Orchestrator] '{name}' in cooldown ({remaining}s remaining)")
                     continue
+
+                cclass = _get_compute_class(name)
+                if cclass == "api_only":
+                    if api_spawn_budget <= 0:
+                        continue
+                else:
+                    # local_gpu / mixed
+                    if local_gpu_running or local_gpu_spawned_this_cycle:
+                        continue  # GPU slot already taken
 
                 # Double-check DB status — if not 'active', agent is definitely not working
                 try:
@@ -1099,15 +1289,26 @@ async def run(once: bool = False):
                     db_status = "unknown"
 
                 if db_status == "active":
-                    # DB says active but we have no PID — stale, fix it
                     _set_status(name, "offline")
                     log.warning(f"[Orchestrator] '{name}' was active in DB but no PID — reset")
 
                 _set_status(name, "starting")
-                log.info(f"[Orchestrator] Starting '{name}' (auto-mode)")
+                log.info(f"[Orchestrator] Starting '{name}' (auto-mode, class={cclass})")
                 _spawn(name)
-                await asyncio.sleep(5)
-                break  # VRAM Guard: only one agent per cycle
+                if cclass == "api_only":
+                    api_spawn_budget -= 1
+                else:
+                    local_gpu_spawned_this_cycle = True
+                await asyncio.sleep(0.2)  # §134 Perf-2: minimal stagger for api_only (was 1s)
+
+            # CR-284: If at least one agent of any class is now running and we
+            # didn't just kick off a new spawn, take a short rest before the next
+            # cycle (matches the original "running → poll-interval sleep" behavior).
+            nothing_new_spawned = (not local_gpu_spawned_this_cycle
+                                   and api_spawn_budget == MAX_CONCURRENT_API_AGENTS - len(api_only_running))
+            if (local_gpu_running or api_only_running) and nothing_new_spawned:
+                await asyncio.sleep(_POLL_INTERVAL)
+                continue
 
             # (requested_state handled at top of loop — always runs)
 

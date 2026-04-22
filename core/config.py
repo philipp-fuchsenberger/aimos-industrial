@@ -60,7 +60,7 @@ class Config:
     AUDIO_INPUT_DEVICE: int = int(os.getenv("AUDIO_INPUT_DEVICE", "10"))
 
     # ── Output Firewall ───────────────────────────────────────────────────
-    CLEAN_CJK: bool = os.getenv("CLEAN_CJK", "true").lower() in ("1", "true", "yes")
+    CLEAN_CJK: bool = os.getenv("CLEAN_CJK", "false").lower() in ("1", "true", "yes")  # Default OFF since qwen3.5 (no CJK drift)
 
     @classmethod
     def get_db_params(cls) -> dict[str, Any]:

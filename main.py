@@ -5,7 +5,7 @@ AIMOS v4.1.0 — Shard Entrypoint
 Orchestriert den AIMOSAgent-Kernel und seine Connectors.
 
 Usage:
-  python main.py                        # default agent, orchestrator mode
+  python main.py                        # default agent 'neo', orchestrator mode
   python main.py --id researcher        # start agent 'researcher'
   python main.py --mode manual          # manual Telegram polling (no orchestrator)
   python main.py --debug                # verbose logging
@@ -13,13 +13,14 @@ Usage:
 
 import argparse
 import asyncio
+import hashlib
 import logging
 import os
 import signal
 import sys
 from pathlib import Path
 
-import psutil
+import asyncpg
 
 from core.config import Config, SecretLogFilter, make_rotating_handler
 from core.agent_base import AIMOSAgent
@@ -82,8 +83,8 @@ def print_banner(agent_id: str, mode: str):
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="AIMOS v4.1.0 — Shard Entrypoint")
     p.add_argument(
-        "--id", default="agent1",
-        help="Agent identifier (default: agent1)",
+        "--id", default="neo",
+        help="Agent identifier (default: neo)",
     )
     p.add_argument(
         "--mode", choices=["manual", "orchestrator"], default="orchestrator",
@@ -98,43 +99,53 @@ def parse_args() -> argparse.Namespace:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def _acquire_pidfile(agent_id: str) -> Path:
-    """Singleton: create PID file or abort if agent already running."""
-    pidfile = Path(f"/tmp/aimos_agent_{agent_id}.pid")
-    if pidfile.exists():
-        try:
-            old_pid = int(pidfile.read_text().strip())
-            if psutil.pid_exists(old_pid):
-                # Check it's actually an AIMOS process, not a recycled PID
-                try:
-                    proc = psutil.Process(old_pid)
-                    cmdline = " ".join(proc.cmdline())
-                    if "main.py" in cmdline and agent_id in cmdline:
-                        print(f"ABORT: Agent '{agent_id}' already running (PID={old_pid})")
-                        sys.exit(1)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-        except (ValueError, OSError):
-            pass
-        # Stale PID file — remove it
-        pidfile.unlink(missing_ok=True)
-    pidfile.write_text(str(os.getpid()))
-    return pidfile
+def _agent_lock_key(agent_id: str) -> int:
+    """Deterministischer Lock-Key für pg_try_advisory_lock.
+
+    Erzeugt aus dem Agent-Namen einen stabilen 64-Bit-Integerwert
+    (obere 32 Bit = fester Namespace, untere 32 Bit = Hash des Namens).
+    """
+    ns = 0x41494D4F  # "AIMO" als Namespace-Präfix
+    h = int(hashlib.sha256(agent_id.encode()).hexdigest()[:8], 16)
+    return (ns << 32) | h
 
 
-def _release_pidfile(agent_id: str):
-    """Remove PID file on exit."""
-    Path(f"/tmp/aimos_agent_{agent_id}.pid").unlink(missing_ok=True)
+async def _acquire_advisory_lock(agent_id: str) -> asyncpg.Connection:
+    """Singleton via PostgreSQL Advisory Lock.
+
+    Öffnet eine eigene DB-Verbindung und hält pg_advisory_lock darauf.
+    Die Verbindung bleibt für die gesamte Prozess-Laufzeit offen —
+    bei Crash/Kill schließt PostgreSQL sie automatisch und gibt den Lock frei.
+
+    Returns:
+        Die Lock-Verbindung (muss offen bleiben solange der Prozess läuft).
+
+    Raises:
+        SystemExit wenn ein anderer Prozess den Lock bereits hält.
+    """
+    lock_key = _agent_lock_key(agent_id)
+    try:
+        conn = await asyncpg.connect(**Config.get_db_params())
+    except Exception as exc:
+        print(f"ABORT: Kann keine DB-Verbindung für Singleton-Lock herstellen: {exc}")
+        sys.exit(1)
+
+    acquired = await conn.fetchval("SELECT pg_try_advisory_lock($1)", lock_key)
+    if not acquired:
+        await conn.close()
+        print(f"ABORT: Agent '{agent_id}' läuft bereits in einer anderen Instanz (advisory_lock={lock_key})")
+        sys.exit(1)
+
+    return conn
 
 
 async def main():
     args = parse_args()
     agent_id = args.id.lower()
 
-    # Singleton guard
-    import atexit
-    pidfile = _acquire_pidfile(agent_id)
-    atexit.register(_release_pidfile, agent_id)
+    # Singleton Guard — PostgreSQL Advisory Lock
+    # Verbindung bleibt offen → Lock wird bei Crash/Kill automatisch freigegeben
+    lock_conn = await _acquire_advisory_lock(agent_id)
 
     log = setup_logging(agent_id, debug=args.debug)
     print_banner(agent_id, args.mode)
@@ -183,9 +194,56 @@ async def main():
             log.info(f"[{agent_id}] Agent stopped.")
         except Exception as exc:
             log.warning(f"Agent stop error: {exc}")
+        # Advisory Lock freigeben (Verbindung schließen)
+        try:
+            await lock_conn.close()
+        except Exception:
+            pass
 
 
 # ── Mode: Orchestrator (DB queue polling, replies via DB relay) ────────────────
+
+async def _process_batch(agent: AIMOSAgent, messages: list[dict], log: logging.Logger):
+    """Delegates to core/batch.py — see CR-233/234/236/237/238."""
+    from core.batch import process_batch
+    await process_batch(agent, messages, log)
+
+
+_HEARTBEAT_FILE = Path("/tmp/aimos_heartbeat")
+_HEARTBEAT_INTERVAL = 30  # seconds — must be well under watchdog threshold (180s)
+
+
+async def _sleep_with_heartbeat(
+    agent: "AIMOSAgent", total_seconds: float, log: logging.Logger,
+):
+    """Sleep for total_seconds while keeping the OS-level heartbeat alive.
+
+    CR-276: The system_watchdog.sh kills all AIMOS processes if
+    /tmp/aimos_heartbeat is stale for >180s. During long poll_interval
+    sleeps (e.g. 3600s for batch agents), we must periodically update
+    the heartbeat file AND the DB agent status.
+    """
+    import time
+    remaining = total_seconds
+    while remaining > 0:
+        chunk = min(remaining, _HEARTBEAT_INTERVAL)
+        await asyncio.sleep(chunk)
+        remaining -= chunk
+        # Update OS-level heartbeat
+        try:
+            _HEARTBEAT_FILE.write_text(str(int(time.time())))
+        except OSError:
+            pass
+        # Update DB status so dashboard shows agent as alive
+        if agent._pool:
+            try:
+                await agent._pool.execute(
+                    "UPDATE agents SET status='idle', updated_at=NOW() WHERE name=$1",
+                    agent.agent_name,
+                )
+            except Exception:
+                pass
+
 
 async def _run_orchestrator(agent: AIMOSAgent, shutdown_event: asyncio.Event):
     """Orchestrator mode: process pending_messages, route replies via dispatch_response."""
@@ -218,6 +276,83 @@ async def _run_orchestrator(agent: AIMOSAgent, shutdown_event: asyncio.Event):
                             "UPDATE agents SET status='idle', updated_at=NOW() WHERE name=$1",
                             agent.agent_name,
                         )
+                # CR-233: Batch execution mode — process all messages as one unit
+                if (
+                    messages
+                    and agent.config.get("execution_strategy") == "batch"
+                ):
+                    await _process_batch(agent, messages, log)
+                    # CR-276: Check if batch has unfinished work (deferred documents).
+                    # If yes, trigger next cycle immediately instead of sleeping.
+                    # The agent knows via state.md / workspace scan whether documents
+                    # were deferred due to max_chunks_per_cycle.
+                    ws_base = Path(f"storage/agents/{agent.agent_name}")
+                    _has_more_work = False
+                    if agent.config.get("batch_workspace_scan"):
+                        from core.batch import _scan_workspace_documents, _DOCUMENT_EXTENSIONS
+                        remaining_docs = _scan_workspace_documents(ws_base, log, agent.agent_name)
+                        if remaining_docs:
+                            _has_more_work = True
+                            log.info(
+                                f"[{agent.agent_name}] CR-276: {len(remaining_docs)} "
+                                f"unprocessed document(s) remain — starting next cycle immediately"
+                            )
+                    if _has_more_work:
+                        # Short pause (10s) to avoid tight-loop, then re-trigger
+                        await _sleep_with_heartbeat(agent, 10, log)
+                        # Re-insert a scheduled_job to trigger the next batch cycle
+                        if agent._pool:
+                            await agent._pool.execute(
+                                "INSERT INTO pending_messages "
+                                "(agent_name, sender_id, content, kind, thread_id, processed) "
+                                "VALUES ($1, 0, 'scheduled_job:continue_analysis', "
+                                "'scheduled_job', $2, FALSE)",
+                                agent.agent_name, f"batch:{agent.agent_name}",
+                            )
+                    else:
+                        # CR-278: All documents processed. If this was an auto-continue
+                        # chain, trigger one final cycle with a "send summary" instruction
+                        # so the agent emails the stakeholder with results.
+                        if messages and messages[0].get("kind") == "scheduled_job":
+                            log.info(
+                                f"[{agent.agent_name}] CR-278: All documents processed — "
+                                f"triggering summary email cycle"
+                            )
+                            # Find the last known email stakeholder from recent messages
+                            _last_email_thread = None
+                            if agent._pool:
+                                _row = await agent._pool.fetchrow(
+                                    "SELECT thread_id FROM pending_messages "
+                                    "WHERE agent_name=$1 AND kind='email' "
+                                    "AND thread_id LIKE 'email:%' "
+                                    "ORDER BY id DESC LIMIT 1",
+                                    agent.agent_name,
+                                )
+                                if _row:
+                                    _last_email_thread = _row["thread_id"]
+                            if _last_email_thread:
+                                import re as _re_email
+                                _addr_match = _re_email.search(
+                                    r'email:([\w.+-]+@[\w.-]+\.\w+)', _last_email_thread,
+                                )
+                                _addr = _addr_match.group(1) if _addr_match else ""
+                                if _addr:
+                                    await agent._pool.execute(
+                                        "INSERT INTO pending_messages "
+                                        "(agent_name, sender_id, content, kind, thread_id, processed) "
+                                        "VALUES ($1, 0, $2, 'email', $3, FALSE)",
+                                        agent.agent_name,
+                                        f"[E-Mail empfangen]\nVon: {_addr}\n"
+                                        f"Betreff: Status update\n"
+                                        f"Text: Please send me a summary of your analysis results.",
+                                        _last_email_thread,
+                                    )
+                                    await _sleep_with_heartbeat(agent, 10, log)
+                                    continue  # Process the summary cycle immediately
+                        # Normal idle sleep
+                        await _sleep_with_heartbeat(agent, poll_interval, log)
+                    continue
+
                 # CR-206: Merge queued messages from same sender+channel into one request
                 # This matches natural chat behavior (user sends multiple messages quickly)
                 merged_messages = merge_queued_messages(messages, agent, log)
@@ -227,6 +362,91 @@ async def _run_orchestrator(agent: AIMOSAgent, shutdown_event: asyncio.Event):
                     content = msg.get("content", "")
                     sender_id = msg.get("sender_id", 0)
                     kind = msg.get("kind", "text")
+
+                    # ADM Pipeline messages must go through agent_base.run_loop()
+                    # which handles set_active_project, _adm_persist_wrapper,
+                    # and enqueue_downstream. The chat-loop here does NOT have
+                    # that pipeline wiring.
+                    #
+                    # §129.4: BOTH `internal` (forward) AND `internal_return`
+                    # (upstream from a self-walkthrough or a real loop) must
+                    # take this path. Previously only `internal` was routed,
+                    # which silently swallowed every Loop B/C/D and self-
+                    # walkthrough patch request — they ran through dispatch_response
+                    # and emitted a chat reply that went nowhere productive.
+                    _msg_project_id = msg.get("project_id")
+                    if kind in ("internal", "internal_return") and _msg_project_id:
+                        log.info(
+                            f"[{agent.agent_name}] Pipeline message "
+                            f"(project={_msg_project_id}, kind={kind}) "
+                            f"→ delegating to run_loop persist path"
+                        )
+                        from core.skills.base import set_active_project, clear_active_project
+                        _proj_token = set_active_project(_msg_project_id)
+                        try:
+                            _think_response = None
+                            _think_success = False
+                            _think_error = None
+                            # Pipeline-Level Retry: bei Mistral-Hiccups (520, Timeout,
+                            # leere Antwort) bis zu 3 Versuche bevor wir aufgeben.
+                            _MIN_VALID_RESPONSE = 50  # chars
+                            _MAX_PIPELINE_RETRIES = 3
+                            for attempt in range(_MAX_PIPELINE_RETRIES):
+                                try:
+                                    _think_response = await asyncio.wait_for(
+                                        agent.think(content), timeout=300
+                                    )
+                                    _resp_len = len(_think_response or "")
+                                    if _resp_len >= _MIN_VALID_RESPONSE:
+                                        _think_success = True
+                                        log.info(
+                                            f"[{agent.agent_name}] think() → {_resp_len} chars "
+                                            f"(attempt {attempt+1})"
+                                        )
+                                        break
+                                    else:
+                                        log.warning(
+                                            f"[{agent.agent_name}] think() too short "
+                                            f"({_resp_len} chars) on attempt {attempt+1} — retrying"
+                                        )
+                                        if attempt < _MAX_PIPELINE_RETRIES - 1:
+                                            await asyncio.sleep(5 * (attempt + 1))
+                                except Exception as exc:
+                                    _think_error = str(exc) or repr(exc)
+                                    import traceback
+                                    log.error(
+                                        f"[{agent.agent_name}] think() exception on "
+                                        f"attempt {attempt+1}: {type(exc).__name__}: {_think_error}\n"
+                                        f"{traceback.format_exc()}"
+                                    )
+                                    if attempt < _MAX_PIPELINE_RETRIES - 1:
+                                        await asyncio.sleep(5 * (attempt + 1))
+
+                            if not _think_success:
+                                log.error(
+                                    f"[{agent.agent_name}] think() failed after "
+                                    f"{_MAX_PIPELINE_RETRIES} attempts — giving up"
+                                )
+
+                            await agent._adm_persist_wrapper(
+                                msg=msg,
+                                think_success=_think_success,
+                                think_error=_think_error,
+                                think_response=_think_response,
+                            )
+                        finally:
+                            clear_active_project(_proj_token)
+                        # L-3: Pipeline agents exit immediately after persist.
+                        # They process exactly one message, then die so the
+                        # orchestrator can spawn the next agent without hitting
+                        # MAX_CONCURRENT_API_AGENTS.
+                        log.info(
+                            f"[{agent.agent_name}] Pipeline message processed "
+                            f"→ exiting immediately (L-3 fast exit)"
+                        )
+                        shutdown_event.set()
+                        return
+                        continue  # unreachable but keeps structure clear
 
                     # CR-203: Skip scheduled jobs if agent has disable_auto_jobs
                     if kind == "scheduled_job" and agent.config.get("disable_auto_jobs"):
@@ -351,7 +571,9 @@ async def _run_orchestrator(agent: AIMOSAgent, shutdown_event: asyncio.Event):
                     agent._tool_call_budget = agent.config.get("max_tool_calls_per_message", 10)
 
                     # CR-206: If marked for escalation (queue overflow), go directly to external API
-                    if msg.get("_escalate_to_external"):
+                    # Pipeline messages (kind=internal) are naturally large (charter+discovery)
+                    # and must NOT be escalated — they need the run_loop persist wrapper.
+                    if msg.get("_escalate_to_external") and msg.get("kind") != "internal":
                         log.info(f"[{agent.agent_name}] CR-206: Queue overflow → direct external API escalation")
                         reply = await external_fallback(agent, content, msg, log,
                                                         reason="queue_overflow")
@@ -397,7 +619,7 @@ async def _run_orchestrator(agent: AIMOSAgent, shutdown_event: asyncio.Event):
                     ):
                         late_msgs = await agent.poll_pending()
                         if not late_msgs:
-                            log.info("[CR-213] Check-before-Send: no late messages — sending reply")
+                            log.info(f"[CR-213] Check-before-Send: no late messages — sending reply")
                         if late_msgs:
                             # L4: For email kind, filter by thread_id instead of sender_id
                             # (sender_id=0 for all emails would match everything)
@@ -525,7 +747,7 @@ async def _run_orchestrator(agent: AIMOSAgent, shutdown_event: asyncio.Event):
                         except Exception as exc:
                             log.warning(f"[CR-thread] Auto-notify failed: {exc}")
 
-                await asyncio.sleep(poll_interval)
+                await _sleep_with_heartbeat(agent, poll_interval, log)
         except asyncio.CancelledError:
             pass
         finally:

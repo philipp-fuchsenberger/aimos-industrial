@@ -174,7 +174,18 @@ def load_tools(agent: AIMOSAgent):
     # Support both "skills" (v4.1+) and legacy "modules" key in DB config
     enabled = set(agent.config.get("skills", agent.config.get("modules", [])))
     if not enabled:
-        enabled = {"brave_search"}
+        # Pipeline-Agenten (adm*/fab*/man*) bekommen KEINE Default-Skills.
+        # brave_search als Default fuer Pipeline-Agenten triggerte fab3v
+        # Tool-Loops bei Acceptance-Tests (RN-022).
+        agent_name = getattr(agent, "agent_name", "")
+        if agent_name.startswith(("adm", "fab", "man", "sup")):
+            enabled = {"file_ops", "current_time"}  # safe minimal set
+            log.warning(
+                f"[{agent_name}] config.skills empty — using safe minimal set "
+                f"(file_ops, current_time) instead of brave_search default"
+            )
+        else:
+            enabled = {"brave_search"}
 
     from core.skills import SKILL_REGISTRY
 
@@ -340,7 +351,8 @@ def load_tools(agent: AIMOSAgent):
             filename = _P(filename).name
         if not filename:
             return "Error: 'filename' is required."
-        if "/" in filename or "\\" in filename or ".." in filename:
+        # Allow relative paths (reference/faq/versand.md) but block traversal
+        if ".." in filename or "\\" in filename or filename.startswith("/"):
             return f"Ungueltiger Dateiname: {filename}"
         workspace = _P("storage") / "agents" / agent.agent_name
         target = workspace / filename
@@ -486,7 +498,8 @@ def load_tools(agent: AIMOSAgent):
         # Input validation
         if not filename or not content:
             return "Error: 'filename' and 'content' are required."
-        if "/" in filename or "\\" in filename or ".." in filename:
+        # Allow relative paths (reference/faq/versand.md) but block traversal
+        if ".." in filename or "\\" in filename or filename.startswith("/"):
             return f"Ungueltiger Dateiname: {filename}"
         workspace = _P("storage") / "agents" / agent.agent_name
         workspace.mkdir(parents=True, exist_ok=True)
@@ -502,13 +515,17 @@ def load_tools(agent: AIMOSAgent):
 
     # Read file tool — read text files from agent workspace
     # CR-091: Big-File-Strategy — files >32k tokens redirect to chunking tools
-    async def tool_read_file(filename: str) -> str:
+    async def tool_read_file(filename: str = "", **kwargs) -> str:
         """Liest eine Textdatei aus dem Workspace des Agenten.
 Bei grossen Dateien (>32k Token) wird automatisch auf den Chunking-Modus verwiesen."""
         from pathlib import Path as _P
+        # CR-271: Accept common aliases (LLMs often guess wrong parameter names)
+        if not filename:
+            filename = kwargs.get("file_path", kwargs.get("path", kwargs.get("name", "")))
         if not filename:
             return "Error: 'filename' is required."
-        if "/" in filename or "\\" in filename or ".." in filename:
+        # Allow relative paths (reference/faq/versand.md) but block traversal
+        if ".." in filename or "\\" in filename or filename.startswith("/"):
             return f"Ungueltiger Dateiname: {filename}"
         workspace = _P("storage") / "agents" / agent.agent_name
         target = workspace / filename
@@ -1169,6 +1186,30 @@ Der Admin legt im Wizard fest, welche Felder der Agent aendern darf."""
             "Sendet eine Nachricht an einen anderen AIMOS-Agenten"
             + (f" (erlaubt: {', '.join(_allowed_agents)})" if _allowed_agents else ""))
         _tools_list += ", send_to_agent"
+
+    # §134: Register agent-specific skills from skills/<agent_name>/*.py
+    # These are Klasse-B skills (tight-loop, no LLM in hot path) that
+    # the LLM can invoke via tool_calls.
+    _agent_skills_dir = Path(__file__).resolve().parent.parent / "skills" / agent.agent_name
+    if _agent_skills_dir.is_dir():
+        import importlib.util as _ilu_skills
+        for _sf in sorted(_agent_skills_dir.glob("*.py")):
+            if _sf.name.startswith("_"):
+                continue
+            _skill_name = _sf.stem
+            try:
+                _spec = _ilu_skills.spec_from_file_location(
+                    f"_agent_skill_{_skill_name}", _sf,
+                )
+                _mod = _ilu_skills.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                # Find the main function (same name as module)
+                _fn = getattr(_mod, _skill_name, None)
+                if _fn and callable(_fn):
+                    agent.register_tool(_skill_name, _fn)
+                    _tools_list += f", {_skill_name}"
+            except Exception as _exc:
+                log.warning(f"§134: failed to register agent skill {_skill_name}: {_exc}")
 
     log.info(f"System tools registered: {_tools_list}"
              + (", update_credential" if _editable_keys else ""))

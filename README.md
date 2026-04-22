@@ -93,12 +93,25 @@ See [docs/DEPLOYMENT_RUNBOOK.md](docs/DEPLOYMENT_RUNBOOK.md) for the full instal
 | Storage | 256 GB NVMe | 512 GB NVMe |
 | CPU | 8 cores | 16 cores |
 
+## LLM Switchboard
+
+The `core/llm/` module is a standalone, provider-agnostic LLM gateway:
+
+- **Multi-provider**: Mistral, Anthropic, Ollama (local), extensible
+- **Key pool**: Rotate multiple API keys, automatic revocation on 401
+- **Rate limiter**: Per-provider token bucket, burst support
+- **Circuit breaker**: Auto-disable failing providers, exponential backoff
+- **Cost tracker**: Per-agent, per-provider cost tracking in real-time
+- **Fallback chains**: Primary -> fallback -> local, configurable per agent
+
 ## Documentation
 
 | Document | Description |
 |---|---|
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture, DB schema, skills |
 | [MEMORY_ARCHITECTURE.md](docs/MEMORY_ARCHITECTURE.md) | Tiered memory, dreaming, hybrid search |
+| [OODA_REFERENCE.md](docs/OODA_REFERENCE.md) | 6-phase OODA batch orchestration |
+| [TOOL_PHASE_MAPPING.md](docs/TOOL_PHASE_MAPPING.md) | Which tools are allowed in which OODA phase |
 | [DEPLOYMENT_RUNBOOK.md](docs/DEPLOYMENT_RUNBOOK.md) | Step-by-step installation guide |
 | [GDPR_COMPLIANCE.md](docs/GDPR_COMPLIANCE.md) | Data protection, PII vault, audit trails |
 | [LLM_REQUEST_ANATOMY.md](docs/LLM_REQUEST_ANATOMY.md) | How an LLM call is constructed |

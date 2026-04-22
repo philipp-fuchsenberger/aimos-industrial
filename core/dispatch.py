@@ -36,6 +36,27 @@ class DispatchMixin:
         # CR-161: Sanitize reply before any outbound delivery
         reply = self._sanitize_reply(reply)
 
+        # Bug #17 fix: Always persist the dispatched answer in chat_histories
+        # so E2E tests and auditors can find it. This is the CUSTOMER-FACING
+        # response, not the internal phase output.
+        import logging as _log17
+        _log17.getLogger("AIMOS.dispatch").info(
+            f"[{getattr(self, 'agent_name', '?')}] Bug17: persisting dispatch reply ({len(reply)} chars)")
+        try:
+            if hasattr(self, "_persist_message"):
+                await self._persist_message("assistant", f"[DISPATCH] {reply}", {"dispatch": True})
+        except Exception as _e17:
+            _log17.getLogger("AIMOS.dispatch").error(f"Bug17 persist failed: {_e17}")
+
+        # §P1.1: PII-Gate — letzte Verteidigungslinie vor User-Delivery
+        if self._contains_pii(reply):
+            _log_dispatch = logging.getLogger("AIMOS.dispatch")
+            _log_dispatch.warning("[%s] DISPATCH_BLOCKED: PII in outbound reply",
+                                  getattr(self, "agent_name", "?"))
+            if hasattr(self, "_audit"):
+                self._audit("DISPATCH_BLOCKED_PII", reply[:200])
+            return "blocked:pii_detected"
+
         kind = msg.get("kind", "")
         sender_id = msg.get("sender_id")
 
@@ -69,10 +90,43 @@ class DispatchMixin:
             return None
 
         if kind == "email":
+            # Batch/Worker agents (Steuerberater, FuSa etc.) handle their own email quality
+            # via system prompt — don't apply reactive-mode filters to them
+            _is_batch = self.config.get("execution_strategy") == "batch"
+
             # Block raw tool-call output from being sent as email
-            if any(marker in reply for marker in ['_icall_', '<tool_call>', '{"name":', '"arguments":']):
+            # CR-273: Batch agents use Draft→Dispatch — their text IS the email body,
+            # not a phantom tool-call. Skip this check for batch agents.
+            if not _is_batch and any(marker in reply for marker in ['_icall_', '<tool_call>', '{"name":', '"arguments":']):
                 self.logger.warning("[Relay] Blocking raw tool-call as email reply")
                 return "email:tool_call_blocked"
+
+            # CR-273: Extract email body from phantom tool-call patterns
+            import re as _re
+
+            # Pattern 1: JSON format — {"body": "..."}
+            _json_match = _re.search(r'"body"\s*:\s*"((?:[^"\\]|\\.)*)"', reply)
+            if _json_match and ('"tool"' in reply or '"send_email"' in reply or '```json' in reply):
+                _extracted = _json_match.group(1).replace('\\n', '\n').replace('\\"', '"')
+                if len(_extracted) > 50:
+                    reply = _extracted
+                    self.logger.info("[CR-273] Extracted body from JSON phantom tool-call")
+
+            # Pattern 2: Python format — send_email(... body="...")
+            if 'send_email(' in reply and 'body="' in reply:
+                _py_match = _re.search(r'body="((?:[^"\\]|\\.)*)"', reply, _re.DOTALL)
+                if _py_match:
+                    _extracted = _py_match.group(1).replace('\\n', '\n').replace('\\"', '"')
+                    if len(_extracted) > 50:
+                        reply = _extracted
+                        self.logger.info("[CR-273] Extracted body from Python phantom tool-call")
+            # Strip remaining Markdown formatting for plain-text email
+            reply = _re.sub(r'\*\*([^*]+)\*\*', r'\1', reply)  # **bold** → bold
+            reply = _re.sub(r'^\|.*\|$', '', reply, flags=_re.MULTILINE)  # Remove table rows
+            reply = _re.sub(r'^[-|]+$', '', reply, flags=_re.MULTILINE)  # Remove table separators
+            reply = _re.sub(r'```[a-z]*\n.*?```', '', reply, flags=_re.DOTALL)  # Remove code blocks
+            reply = _re.sub(r'\n{3,}', '\n\n', reply)  # Collapse multiple blank lines
+            reply = reply.strip()
             # L1: Auto-reply to email sender — queue as outbound_email for shared_listener
             # Skip internal status messages — these are not customer replies
             _status_patterns = [
@@ -107,17 +161,20 @@ class DispatchMixin:
                     "kosten", "preis", "eur", "€",
                 ]
                 _has_promise = any(p in reply.lower() for p in _promise_patterns)
-                if _has_promise:
+                if _has_promise and not _is_batch:
                     self.logger.info(f"[Relay] Blocking promise-email after delegation: {reply[:80]}")
                     return "email:post_delegation_promise_blocked"
                 # Short confirmation is OK (e.g. "Ihre Anfrage wird bearbeitet")
                 self.logger.info(f"[Relay] Allowing confirmation email after delegation: {reply[:80]}")
-            if _is_status:
+            if _is_status and not _is_batch:
                 self.logger.info(f"[Relay] Skipping internal status as email reply: {reply[:80]}")
                 return "email:status_skipped"
             import re as _re_email
             msg_content = msg.get("content", "")
             from_match = _re_email.search(r'Von:\s*(.+?)[\n\r]', msg_content)
+            # CR-250: Proactive messages have "Kunden-Email:" instead of "Von:"
+            if not from_match:
+                from_match = _re_email.search(r'Kunden-Email:\s*(\S+)', msg_content)
             subj_match = _re_email.search(r'Betreff:\s*(.+?)[\n\r]', msg_content)
             if from_match and self._pool:
                 to_raw = from_match.group(1).strip()
@@ -266,7 +323,7 @@ class DispatchMixin:
             self.logger.info("Reply → Voice TTS (not yet implemented)")
             return "voice:pending"
 
-        if kind == "internal":
+        if kind in ("internal", "internal_return"):
             # CR-115: Auto-reply to the sending agent AND forward to user's Telegram
             import re as _re
             if self._pool:

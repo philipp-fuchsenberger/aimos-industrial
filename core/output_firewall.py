@@ -198,6 +198,197 @@ class OutputFirewallMixin:
             self.logger.debug(f"[CR-114b] Force tool failed: {exc}")
             return False
 
+    # §P1.1: PII-Patterns als Klassen-Attribut (wiederverwendbar in dispatch)
+    _PII_PATTERNS = [
+        (re.compile(r"\b[A-Z][a-zäöü]+\s+[A-Z][a-zäöü]+,?\s*\d{5}\s+\w+"), "Adresse"),
+        (re.compile(r"\bDE\d{2}\s?\d{4}\s?\d{4}\s?\d{4}\s?\d{4}\s?\d{2}\b"), "IBAN"),
+        (re.compile(r"\b\d{3}[-/]\d{8,12}\b"), "Steuernummer"),
+        (re.compile(r"\b(?:Sozialversicherungsnummer|Rentenversicherungsnummer)\s*:?\s*\d"), "SVN"),
+    ]
+
+    async def _validate_output(self, reply: str) -> tuple[str, list[tuple[str, str, str]]]:
+        """§P1.1 Harness Output-Validation mit Severity-Klassifizierung.
+
+        Returns (reply, violations) wobei violations = [(severity, type, msg)].
+        Severity: CRITICAL (muss blockiert werden), HIGH (blockieren fuer chatbot),
+                  MEDIUM (nur loggen).
+        """
+        if not reply or len(reply) < 20:
+            return reply, []
+
+        violations: list[tuple[str, str, str]] = []
+        reply_lower = reply.lower()
+
+        # ── 1. PII-Leak (CRITICAL — muss immer blockiert werden) ──
+        for pattern, label in self._PII_PATTERNS:
+            if pattern.search(reply):
+                violations.append(("CRITICAL", "PII", f"{label}-Muster erkannt"))
+
+        # ── 2. System-Prompt-Leak (CRITICAL) ──
+        _leak_patterns = [
+            r"(?:hier|dies) (?:ist|sind) (?:mein|der) system.?prompt",
+            r"meine anweisungen (?:lauten|sind|sagen)",
+            r"<immutable_rules>",
+            r"<context_boundary>",
+        ]
+        for lp in _leak_patterns:
+            if re.search(lp, reply_lower):
+                violations.append(("CRITICAL", "LEAK", "System-Prompt-Leak erkannt"))
+                break
+
+        # ── 3. Charter-Verbote (HIGH bei >=80%, MEDIUM bei 60-80%) ──
+        agent_config = getattr(self, "_agent_config", {})
+        verbote = agent_config.get("verbote", [])
+        for v in verbote:
+            keywords = [w for w in v.lower().split() if len(w) > 4]
+            if not keywords:
+                continue
+            matched = sum(1 for kw in keywords if kw in reply_lower)
+            ratio = matched / len(keywords)
+            if ratio >= 0.8:
+                violations.append(("HIGH", "VERBOT", f"Verletzung (≥80%): '{v[:80]}'"))
+            elif ratio >= 0.6:
+                violations.append(("MEDIUM", "VERBOT", f"Mögliche Verletzung (60-80%): '{v[:80]}'"))
+
+        # ── 4. Scope-Violation (HIGH) ──
+        _scope_red_flags = [
+            (r"(?:als (?:Arzt|Anwalt|Steuerberater|Notar) rate ich)", "Unbefugte Fachberatung"),
+            (r"(?:meine (?:Diagnose|Prognose|rechtliche Einschätzung) ist)", "Unbefugte Fachaussage"),
+            (r"(?:garantiere ich|kann ich garantieren)", "Unerlaubte Garantie"),
+        ]
+        for pattern, label in _scope_red_flags:
+            if re.search(pattern, reply, re.IGNORECASE):
+                violations.append(("HIGH", "SCOPE", label))
+
+        # ── 5. Logging + Audit ──
+        if violations:
+            agent_name = getattr(self, "agent_name", "unknown")
+            for sev, vtype, vmsg in violations:
+                _log.warning("[%s] OUTPUT_VIOLATION %s/%s: %s", agent_name, sev, vtype, vmsg)
+            if hasattr(self, "_audit"):
+                self._audit("OUTPUT_VALIDATION", json.dumps(
+                    [{"severity": s, "type": t, "msg": m} for s, t, m in violations],
+                    ensure_ascii=False,
+                ))
+
+        return reply, violations
+
+    def _get_safe_fallback(self, violations: list[tuple[str, str, str]]) -> str:
+        """§P1.1: Sichere Fallback-Antwort wenn Output blockiert wird."""
+        agent_config = getattr(self, "_agent_config", {}) if hasattr(self, "_agent_config") else {}
+        fallback = agent_config.get("safety_fallback_text", "")
+        if fallback:
+            return fallback
+        return "Entschuldigung, ich kann diese Anfrage nicht bearbeiten. Bitte wende dich an einen Mitarbeiter."
+
+    @staticmethod
+    def _contains_pii(text: str) -> bool:
+        """§P1.1: Schneller PII-Check fuer dispatch_response Gate."""
+        for pattern, _ in OutputFirewallMixin._PII_PATTERNS:
+            if pattern.search(text):
+                return True
+        return False
+
+    # §P1.2: Self-Verification Circuit Breaker State
+    _verify_failures: int = 0
+    _verify_disabled_until: float = 0.0
+
+    _UNCERTAINTY_RE = re.compile(
+        r'(?:ich glaube|I believe|I think|vermutlich|wahrscheinlich|'
+        r'möglicherweise|possibly|probably|meines Wissens|'
+        r'soweit ich weiß|as far as I know|das müsste|das sollte)',
+        re.IGNORECASE,
+    )
+
+    def _should_verify(self, reply: str, violations: list[tuple[str, str, str]]) -> bool:
+        """§P1.2: Entscheidet ob Cross-Provider-Verification noetig ist.
+
+        Verifiziert nur wenn: Unsicherheits-Marker vorhanden, Antwort > 200 Zeichen,
+        oder deterministische Violations gefunden.
+        """
+        import time
+        # Circuit Breaker: temporaer deaktiviert nach 3 Timeouts
+        if time.time() < self._verify_disabled_until:
+            return False
+        if len(reply) < 200:
+            return False
+        if violations:
+            return True  # Immer verifizieren wenn Violations erkannt
+        if self._UNCERTAINTY_RE.search(reply):
+            return True
+        return False
+
+    async def _verify_with_cross_provider(
+        self, reply: str, user_message: str, violations: list[tuple[str, str, str]]
+    ) -> tuple[str, bool]:
+        """§P1.2: Cross-Provider-Verification der Agent-Antwort.
+
+        Nutzt einen ANDEREN LLM-Provider als den Agent-Primary.
+        Returns (reply_or_fallback, was_modified).
+        """
+        import time
+        try:
+            from core.llm import router
+
+            # Bestimme Cross-Provider
+            agent_config = getattr(self, "_agent_config", {}) if hasattr(self, "_agent_config") else {}
+            primary_provider = agent_config.get("llm_provider", "mistral")
+            if primary_provider == "mistral":
+                verify_provider = "anthropic"
+                verify_model = "claude-haiku-4-5-20251001"
+            else:
+                verify_provider = "mistral"
+                verify_model = "mistral-small-latest"
+
+            violation_summary = ""
+            if violations:
+                violation_summary = " Erkannte Probleme: " + "; ".join(
+                    f"{s}/{t}: {m}" for s, t, m in violations[:3]
+                )
+
+            verify_prompt = (
+                f"Du bist ein Safety-Reviewer. Pruefe diese Agent-Antwort:\n\n"
+                f"User-Frage: {user_message[:200]}\n"
+                f"Agent-Antwort: {reply[:500]}\n"
+                f"{violation_summary}\n\n"
+                f"Antworte NUR mit PASS oder FAIL: [ein Satz Begruendung].\n"
+                f"FAIL-Kriterien: Fakten-Halluzination, PII-Leak, Scope-Verletzung, schaedlicher Inhalt."
+            )
+
+            resp = await router.call(
+                provider=verify_provider,
+                model=verify_model,
+                messages=[{"role": "user", "content": verify_prompt}],
+                temperature=0.0,
+                max_tokens=100,
+                timeout_s=15,
+            )
+            content = resp.get("content", "").strip()
+            agent_name = getattr(self, "agent_name", "unknown")
+
+            # Circuit Breaker: Reset bei Erfolg
+            self._verify_failures = 0
+
+            if content.upper().startswith("FAIL"):
+                _log.warning("[%s] SELF_VERIFY FAIL: %s", agent_name, content[:150])
+                if hasattr(self, "_audit"):
+                    self._audit("SELF_VERIFY_FAIL", content[:200])
+                return self._get_safe_fallback(violations), True
+
+            _log.info("[%s] SELF_VERIFY PASS", agent_name)
+            return reply, False
+
+        except Exception as exc:
+            # Circuit Breaker: nach 3 Failures fuer 5min deaktivieren
+            self._verify_failures += 1
+            if self._verify_failures >= 3:
+                self._verify_disabled_until = time.time() + 300
+                _log.warning("[%s] SELF_VERIFY circuit breaker: disabled for 5min after %d failures",
+                             getattr(self, "agent_name", "?"), self._verify_failures)
+            _log.debug("[%s] SELF_VERIFY error (non-blocking): %s",
+                       getattr(self, "agent_name", "?"), exc)
+            return reply, False
+
     def _check_confidence(self, reply: str, tool_results: list[str]) -> str:
         """CR-159: Detect potential hallucination patterns and log warnings.
 
