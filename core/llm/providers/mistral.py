@@ -160,7 +160,11 @@ def _convert_messages(messages: list[dict]) -> list[dict]:
                     "content": content if isinstance(content, str) else json.dumps(content),
                     "tool_call_id": m.get("tool_call_id", ""),
                 })
-            # else: drop orphaned tool message
+            else:
+                # Orphaned tool message (from batch OODA phases) → convert to user
+                tool_name = m.get("name", "tool")
+                tool_content = content if isinstance(content, str) else json.dumps(content)
+                out.append({"role": "user", "content": f"Tool '{tool_name}' returned:\n{tool_content}"})
         elif role == "assistant" and m.get("tool_calls"):
             msg = {"role": "assistant", "content": content, "tool_calls": m["tool_calls"]}
             out.append(msg)

@@ -18,11 +18,11 @@ _PRICES_USD = {
     "magistral-small-latest":    (0.50, 1.50),     # same price as Large 3, reasoning-optimized → ADM.3 default
     "magistral-medium-latest":   (2.00, 5.00),     # premium reasoning, only when Magistral Small fails
     # Coding specialists (verified against api.mistral.ai 2026-04-11)
-    "devstral-latest":           (0.40, 2.00),
+    # NOTE: devstral-small-2507 + devstral-medium-2507 retiring 2026-05-31
+    # (Mistral Deprecation Notice 2026-05-04). Migrated callers to
+    # `devstral-latest` (price ↑ from $0.10/$0.30 to $0.40/$2.00).
+    "devstral-latest":           (0.40, 2.00),     # replacement for retired 2507-variants
     "devstral-2512":             (0.40, 2.00),
-    "devstral-medium-latest":    (0.40, 2.00),
-    "devstral-medium-2507":      (0.40, 2.00),
-    "devstral-small-2507":       (0.10, 0.30),     # smallest devstral — fab5b primary
     "codestral-latest":          (0.30, 0.90),
     "codestral-2508":            (0.30, 0.90),
     # Vision
@@ -44,6 +44,22 @@ _PRICES_USD = {
     "claude-sonnet-4-6":         (3.00, 15.00),
     "claude-opus-4-6":           (15.00, 75.00),
     "claude-haiku-4-5":          (0.80, 4.00),
+    # Groq (CR-299, 2026-05-05) — sehr schnell, Cross-Provider-Diversitaet
+    # Verifiziert gegen groq.com/pricing 2026-05-05
+    "llama-3.3-70b-versatile":   (0.59, 0.79),     # 128K context, schnell, Tool-Calls
+    "llama-3.1-70b-versatile":   (0.59, 0.79),
+    "llama-3.1-8b-instant":      (0.05, 0.08),     # sehr guenstig, Routine, ~1000 t/s
+    "mixtral-8x7b-32768":        (0.24, 0.24),     # 32K context, Tool-Calls
+    "gemma2-9b-it":              (0.20, 0.20),     # 9B, schnell, mittel
+    "gemma-4-31b":               (0.40, 0.60),     # CR-301/Gemma4: 31B Dense, multimodal
+                                                    # NICHT auf API verfuegbar Stand 2026-05;
+                                                    # Pricing geschaetzt fuer baldigen API-Release
+    "deepseek-r1-distill-llama-70b": (0.75, 0.99),  # Reasoning auf Groq
+    # DeepSeek (CR-299, 2026-05-05) — sehr guenstig, gut bei Code
+    # Verifiziert gegen api-docs.deepseek.com/quick_start/pricing 2026-05-05
+    "deepseek-chat":             (0.27, 1.10),     # V3, Tool-Calls, Worker-Default
+    "deepseek-reasoner":         (0.55, 2.19),     # R1, Reasoning-Modell
+    "deepseek-coder":            (0.14, 0.28),     # Code-Aufgaben
     # Local — no API cost
     "qwen3.5:27b":               (0.0, 0.0),
     "qwen2.5:32b":               (0.0, 0.0),

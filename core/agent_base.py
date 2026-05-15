@@ -1283,9 +1283,15 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
                     _reason = self.config.get("llm_reasoning_effort") or None
                     _rfmt = self.config.get("llm_response_format") or None
                     _timeout = float(self.config.get("llm_timeout_s", 90.0))
+                    # CR-301: produktiv-Agenten (mca_*) bleiben strikt bei ihrem
+                    # entwickelten Provider, kein Cross-Provider-Fallback.
+                    # Default false — fab*-Agenten und Legacy bleiben tolerant.
+                    _strict = bool(self.config.get("strict_provider", False))
+                    _qgate = bool(self.config.get("quality_gate", True))
                     self._audit(
                         "LLM_CALL",
-                        f"router={_provider}/{_model} msgs={len(messages)}"
+                        f"router={_provider}/{_model} msgs={len(messages)} "
+                        f"strict={_strict} qgate={_qgate}"
                     )
                     result = await _llm_router.call(
                         provider=_provider,
@@ -1299,6 +1305,9 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
                         fallback=_fb,
                         reasoning_effort=_reason,
                         response_format=_rfmt,
+                        strict_provider=_strict,
+                        quality_gate=_qgate,
+                        agent_name=self.agent_name,
                     )
                     in_t = result.get("in_tokens", 0)
                     out_t = result.get("out_tokens", 0)
@@ -1661,7 +1670,7 @@ class AIMOSAgent(DispatchMixin, OutputFirewallMixin):
                 session_boost = 1.0
                 session_id = getattr(self, '_current_session_id', '')
                 if session_id:
-                    # Extract identifier (e.g. "7995386919" from "telegram:7995386919")
+                    # Extract identifier (e.g. "123456789" from "telegram:123456789")
                     sid_parts = session_id.split(":", 1)
                     sid_val = sid_parts[1] if len(sid_parts) > 1 else session_id
                     key_lower = (key or "").lower()

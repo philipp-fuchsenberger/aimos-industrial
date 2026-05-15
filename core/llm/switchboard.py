@@ -21,6 +21,8 @@ NOT responsible for (V-05):
 """
 from __future__ import annotations
 
+import os
+import json
 import logging
 import time
 
@@ -38,6 +40,53 @@ log = logging.getLogger("AIMOS.llm.switchboard")
 
 class SwitchboardError(RuntimeError):
     """All providers in fallback chain failed."""
+
+
+# CR-301/F: Pre-Return-Quality-Gate
+def _validate_output_quality(
+    result: dict,
+    response_format: dict | None,
+    quality_gate_enabled: bool = True,
+) -> tuple[bool, str | None]:
+    """Pre-Return-Quality-Gate fuer LLM-Outputs.
+
+    Schuetzt Caller davor, abgeschnittene oder leere Antworten als
+    Erfolg zu interpretieren. Zentraler Schutz, damit produktiv-Agenten
+    (strict_provider=True) nicht „mist abliefern" sondern lieber FAILEN.
+
+    Returns:
+        (True, None) wenn alles ok
+        (False, reason) wenn Quality-Issue erkannt
+
+    Reasons:
+        - "truncated_max_tokens": finish_reason=length (Output abgeschnitten)
+        - "empty_response": kein content + keine tool_calls
+        - "invalid_json": response_format=json_object verlangt, aber Content
+          nicht parsbar
+    """
+    if not quality_gate_enabled:
+        return True, None
+
+    # 1. Truncation
+    finish = result.get("finish_reason")
+    if finish == "length":
+        return False, "truncated_max_tokens"
+
+    # 2. Leere Antwort
+    content = (result.get("content") or "").strip()
+    tool_calls = result.get("tool_calls") or []
+    if not content and not tool_calls:
+        return False, "empty_response"
+
+    # 3. JSON-Parse-Check wenn explizit als JSON angefordert
+    if response_format and response_format.get("type") in ("json_object", "json_schema"):
+        if content:
+            try:
+                json.loads(content)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return False, "invalid_json"
+
+    return True, None
     pass
 
 
@@ -143,6 +192,8 @@ class Switchboard:
         allow_degraded: bool = True,
         agent_name: str | None = None,
         priority: int = 1,
+        strict_provider: bool = False,    # CR-301: produktiv-Agent, kein Cross-Provider-Fallback
+        quality_gate: bool = True,        # CR-301: Pre-Return-Validierung
     ) -> dict:
         """Dispatch an LLM call through the switchboard.
 
@@ -181,7 +232,17 @@ class Switchboard:
                         )
                         provider, model = cheaper
 
-        chain = self._build_chain(provider, model, fallback, allow_degraded)
+        # CR-301: strict_provider deaktiviert Cross-Provider-Fallback komplett.
+        # Caller bekommt nur Same-Provider-Retry (durch Provider-internen
+        # Retry-Loop) oder einen Fehler. Lieber WAITING als unkonsistenter Output.
+        # CR-301: tools_required → Capability-Filter im _build_chain
+        tools_required = bool(tools)
+        chain = self._build_chain(
+            provider, model,
+            fallback if not strict_provider else None,
+            allow_degraded and not strict_provider,
+            tools_required=tools_required,
+        )
 
         if not chain:
             raise SwitchboardError(
@@ -285,6 +346,24 @@ class Switchboard:
                         f"(finish_reason=length)"
                     )
 
+                # CR-301/F: Pre-Return-Quality-Gate
+                gate_ok, gate_reason = _validate_output_quality(
+                    result, response_format, quality_gate,
+                )
+                if not gate_ok:
+                    log.warning(
+                        f"[switchboard] Quality-Gate FAIL fuer {prov_name}/{mod}: "
+                        f"{gate_reason} (strict_provider={strict_provider})"
+                    )
+                    last_error = SwitchboardError(
+                        f"Quality gate failed for {prov_name}/{mod}: {gate_reason}"
+                    )
+                    is_primary = False
+                    # Nicht returnen — naechste Iteration versucht den naechsten
+                    # Provider (im strict-Modus ist die Chain leer ausser Primary,
+                    # also wird der Loop danach mit SwitchboardError beendet).
+                    continue
+
                 return result
 
             except Exception as exc:
@@ -342,8 +421,15 @@ class Switchboard:
         model: str,
         fallback: list[dict] | None,
         allow_degraded: bool,
+        tools_required: bool = False,   # CR-301/K: Capability-Filter
     ) -> list[tuple[str, str]]:
-        """Build the fallback chain from primary + explicit fallback + Ollama."""
+        """Build the fallback chain from primary + explicit fallback + Ollama.
+
+        CR-301/K: Wenn `tools_required=True`, werden Modelle ohne
+        Tool-Calling-Support aus der Chain gefiltert (z.B. deepseek-reasoner,
+        magistral-small ohne Tools). Sonst koennte ein Fallback auf so ein
+        Modell silent das Tool-Call-Ergebnis verschlucken.
+        """
         chain: list[tuple[str, str]] = [(provider, model)]
 
         if fallback:
@@ -360,6 +446,26 @@ class Switchboard:
                 ollama_models = getattr(ollama_prov, "available_models", [])
                 if ollama_models:
                     chain.append(("ollama", ollama_models[0]))
+
+        # CR-301/K: Capability-Filter — wenn tools im Aufruf, schmeiss Modelle
+        # ohne Tool-Support raus. Primary bleibt drin (auch wenn er kein Tool
+        # hat — Caller-Verantwortung), aber Fallbacks werden gefiltert.
+        if tools_required and self._capabilities:
+            primary = chain[0]
+            filtered_fallbacks = []
+            for prov, mod in chain[1:]:
+                model_info = self._capabilities.get_model(mod)
+                if model_info is None:
+                    # unbekanntes Modell — durchlassen, vielleicht hat es Tools
+                    filtered_fallbacks.append((prov, mod))
+                elif model_info.supports_tools:
+                    filtered_fallbacks.append((prov, mod))
+                else:
+                    log.info(
+                        f"[switchboard] CR-301/K: filter {prov}/{mod} aus Chain — "
+                        f"supports_tools=False, aber tools_required=True"
+                    )
+            chain = [primary] + filtered_fallbacks
 
         return chain
 
@@ -461,7 +567,7 @@ class Switchboard:
                     "(agent_name, sender_id, content, kind) "
                     "VALUES ($1, $2, $3, 'outbound_telegram')",
                     agent_name,
-                    7995386919,  # Operator Telegram Chat-ID
+                    int(os.getenv("AIMOS_OPERATOR_TELEGRAM_CHAT_ID", "0")),  # configurable
                     f"💰 BUDGET {level}: Agent '{agent_name}'\n"
                     f"Kosten heute: ${cost:.4f} / Cap: ${cap:.2f}\n"
                     f"Ratio: {cost/cap:.0%}",

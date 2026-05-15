@@ -116,6 +116,13 @@ def _split_system(messages: list[dict]) -> tuple[str, list[dict]]:
             content = m.get("content", "")
             if isinstance(content, str):
                 system_parts.append(content)
+        elif role == "tool":
+            # Orphaned tool results (from batch OODA phases) → convert to user
+            tool_name = m.get("name", "tool")
+            tool_content = m.get("content", "")
+            if isinstance(tool_content, list):
+                tool_content = str(tool_content)
+            conv.append({"role": "user", "content": f"Tool '{tool_name}' returned:\n{tool_content}"})
         else:
             conv.append({"role": role, "content": m.get("content", "")})
     return ("\n\n".join(system_parts), conv)

@@ -41,12 +41,26 @@ async def init_llm_switchboard(
     from .providers.mistral import MistralProvider
     from .providers.anthropic import AnthropicProvider
     from .providers.ollama import LocalLLMProvider
+    # CR-299 (2026-05-05): Cross-Provider-Diversitaet
+    from .providers.groq import GroqProvider
+    from .providers.deepseek import DeepSeekProvider
+    import os as _os
 
     if not is_registered("mistral"):
         register("mistral", MistralProvider())
 
     if not is_registered("anthropic"):
         register("anthropic", AnthropicProvider())
+
+    # CR-299: Groq (nur wenn API-Key vorhanden)
+    if not is_registered("groq") and _os.environ.get("GROQ_API_KEY"):
+        register("groq", GroqProvider())
+        log.info("[bootstrap] groq registered (API-Key vorhanden)")
+
+    # CR-299: DeepSeek (nur wenn API-Key vorhanden)
+    if not is_registered("deepseek") and _os.environ.get("DEEPSEEK_API_KEY"):
+        register("deepseek", DeepSeekProvider())
+        log.info("[bootstrap] deepseek registered (API-Key vorhanden)")
 
     # Local LLM (Ollama or SGLang/vLLM)
     if not is_registered("ollama"):

@@ -28,10 +28,12 @@ import threading
 
 from .providers import mistral as _mistral
 from .providers import anthropic as _anthropic
+from .providers import groq as _groq
+from .providers import deepseek as _deepseek
 
 log = logging.getLogger("AIMOS.llm.router")
 
-_KNOWN_PROVIDERS = {"mistral", "anthropic"}
+_KNOWN_PROVIDERS = {"mistral", "anthropic", "groq", "deepseek"}  # CR-299: Cross-Provider
 
 # ── Sektion 108.1: Process-local Cost-Cap (legacy, kept for warnings) ───
 _project_costs: dict[str, float] = {}
@@ -286,6 +288,9 @@ async def call(
     fallback: list[dict] | None = None,
     reasoning_effort: str | None = None,
     response_format: dict | None = None,
+    strict_provider: bool = False,    # CR-301: produktiv-Agenten setzen das auf True
+    quality_gate: bool = True,        # CR-301: Pre-Return-Validierung default an
+    agent_name: str | None = None,    # fuer cost-tracking + budget
 ) -> dict:
     """Dispatch an LLM call to the requested provider.
 
@@ -314,6 +319,70 @@ async def call(
     if active_pid:
         check_persisted_cap(active_pid)  # raises BudgetExceededError if over
 
+    # CR-164 (Phase Plattform-2): GPU-Lock für lokale Ollama-Calls.
+    # Cloud-Provider (mistral/anthropic/groq/deepseek) werden NICHT gelockt —
+    # parallele Aufrufe sind dort gewollt und für Token-Effizienz wichtig.
+    # Ollama-Calls auf einer geteilten GPU/CPU müssen aber sequenziell laufen,
+    # sonst OOM oder Schlange.
+    _gpu_lock_handle = None
+    if provider == "ollama":
+        try:
+            from core.orchestrator import _acquire_gpu  # type: ignore
+            # Polling-Loop: bis zu 10 Min auf GPU warten
+            import time as _time
+            wait_start = _time.time()
+            while True:
+                _gpu_lock_handle = _acquire_gpu()
+                if _gpu_lock_handle is not None:
+                    break
+                if _time.time() - wait_start > 600:
+                    log.warning("[router] GPU-Lock-Wait > 10min für Ollama — gebe auf, gehe ohne Lock")
+                    break
+                import asyncio as _asyncio
+                await _asyncio.sleep(0.5)
+        except Exception as _gpu_exc:
+            log.warning(f"[router] GPU-Lock-Acquire fehlgeschlagen ({_gpu_exc}) — Ollama-Call ohne Lock")
+            _gpu_lock_handle = None
+
+    try:
+        return await _call_inner(
+            provider=provider, model=model, messages=messages, tools=tools,
+            temperature=temperature, max_tokens=max_tokens, stop=stop,
+            timeout_s=timeout_s, fallback=fallback,
+            reasoning_effort=reasoning_effort, response_format=response_format,
+            strict_provider=strict_provider, quality_gate=quality_gate,
+            agent_name=agent_name, active_pid=active_pid,
+        )
+    finally:
+        # GPU-Lock immer freigeben (auch bei Exception)
+        if _gpu_lock_handle is not None:
+            try:
+                import fcntl
+                fcntl.flock(_gpu_lock_handle, fcntl.LOCK_UN)
+                _gpu_lock_handle.close()
+            except Exception:
+                pass
+
+
+async def _call_inner(
+    *,
+    provider: str,
+    model: str,
+    messages: list[dict],
+    tools: list[dict] | None,
+    temperature: float,
+    max_tokens: int,
+    stop: list[str] | None,
+    timeout_s: float,
+    fallback: list[dict] | None,
+    reasoning_effort: str | None,
+    response_format: dict | None,
+    strict_provider: bool,
+    quality_gate: bool,
+    agent_name: str | None,
+    active_pid,
+) -> dict:
+    """Inner Dispatch — wird von call() umrahmt durch GPU-Lock für Ollama."""
     # ── Switchboard path (new) ───────────────────────────────────────────
     if _switchboard is not None:
         from .switchboard import SwitchboardError
@@ -330,6 +399,9 @@ async def call(
                 fallback=fallback,
                 reasoning_effort=reasoning_effort,
                 response_format=response_format,
+                strict_provider=strict_provider,
+                quality_gate=quality_gate,
+                agent_name=agent_name,
             )
         except SwitchboardError as exc:
             raise LLMRouterError(str(exc)) from exc
@@ -388,6 +460,22 @@ async def call(
                         model=mod, messages=_msgs, tools=tools,
                         temperature=temperature, max_tokens=max_tokens,
                         stop=stop, timeout_s=timeout_s,
+                    )
+                elif prov == "groq":
+                    # CR-299: Groq via OpenAI-compat API
+                    result = await _groq.call(
+                        model=mod, messages=messages, tools=tools,
+                        temperature=temperature, max_tokens=max_tokens,
+                        stop=stop, timeout_s=timeout_s,
+                        response_format=response_format,
+                    )
+                elif prov == "deepseek":
+                    # CR-299: DeepSeek via OpenAI-compat API
+                    result = await _deepseek.call(
+                        model=mod, messages=messages, tools=tools,
+                        temperature=temperature, max_tokens=max_tokens,
+                        stop=stop, timeout_s=timeout_s,
+                        response_format=response_format,
                     )
                 else:
                     raise LLMRouterError(f"Unknown provider '{prov}'")

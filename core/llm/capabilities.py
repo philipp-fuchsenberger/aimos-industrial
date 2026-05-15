@@ -80,12 +80,9 @@ _MODELS: dict[str, ModelInfo] = {
         supports_tools=True, supports_vision=False,
         supports_reasoning=False, cost_tier="medium",
     ),
-    "devstral-small-2507": ModelInfo(
-        provider="mistral", model_id="devstral-small-2507",
-        context_window=128_000, max_output=32_000,
-        supports_tools=True, supports_vision=False,
-        supports_reasoning=False, cost_tier="cheap",
-    ),
+    # devstral-small-2507 + devstral-medium-2507 → retiring 2026-05-31
+    # (Mistral Deprecation 2026-05-04). Migrated to `devstral-latest` —
+    # neuer Preis $0.4/$2.0 (4× / 6.7× teurer als devstral-small-2507).
     "codestral-latest": ModelInfo(
         provider="mistral", model_id="codestral-latest",
         context_window=256_000, max_output=32_000,
@@ -123,6 +120,71 @@ _MODELS: dict[str, ModelInfo] = {
         context_window=200_000, max_output=8_192,
         supports_tools=True, supports_vision=True,
         supports_reasoning=False, cost_tier="medium",
+    ),
+    # ── Groq (CR-299, 2026-05-05) — Cross-Provider-Diversitaet ────────
+    "llama-3.3-70b-versatile": ModelInfo(
+        provider="groq", model_id="llama-3.3-70b-versatile",
+        context_window=128_000, max_output=32_000,
+        supports_tools=True, supports_vision=False,
+        supports_reasoning=False, cost_tier="cheap",
+    ),
+    "llama-3.1-70b-versatile": ModelInfo(
+        provider="groq", model_id="llama-3.1-70b-versatile",
+        context_window=128_000, max_output=32_000,
+        supports_tools=True, supports_vision=False,
+        supports_reasoning=False, cost_tier="cheap",
+    ),
+    "llama-3.1-8b-instant": ModelInfo(
+        provider="groq", model_id="llama-3.1-8b-instant",
+        context_window=128_000, max_output=8_192,
+        supports_tools=True, supports_vision=False,
+        supports_reasoning=False, cost_tier="cheap",
+    ),
+    "mixtral-8x7b-32768": ModelInfo(
+        provider="groq", model_id="mixtral-8x7b-32768",
+        context_window=32_000, max_output=8_192,
+        supports_tools=True, supports_vision=False,
+        supports_reasoning=False, cost_tier="cheap",
+    ),
+    "deepseek-r1-distill-llama-70b": ModelInfo(
+        provider="groq", model_id="deepseek-r1-distill-llama-70b",
+        context_window=128_000, max_output=8_192,
+        supports_tools=False, supports_vision=False,
+        supports_reasoning=True, cost_tier="medium",
+    ),
+    # CR-301/Gemma4: Google Gemma 4 (Apache 2.0, released 2026-04-02)
+    # Multimodal, exzellent fuer Edge. API-Verfuegbarkeit 2026-05 noch nicht;
+    # Eintrag fuer baldigen Google AI Studio + Groq-Support
+    "gemma-4-31b": ModelInfo(
+        provider="groq", model_id="gemma-4-31b",
+        context_window=128_000, max_output=16_384,
+        supports_tools=True, supports_vision=True,
+        supports_reasoning=True, cost_tier="cheap",
+    ),
+    "gemma-4-26b-moe": ModelInfo(
+        provider="groq", model_id="gemma-4-26b-moe",
+        context_window=128_000, max_output=8_192,
+        supports_tools=True, supports_vision=True,
+        supports_reasoning=False, cost_tier="cheap",
+    ),
+    # ── DeepSeek (CR-299, 2026-05-05) — guenstig, Code-Spezialist ──────
+    "deepseek-chat": ModelInfo(
+        provider="deepseek", model_id="deepseek-chat",
+        context_window=128_000, max_output=8_192,
+        supports_tools=True, supports_vision=False,
+        supports_reasoning=False, cost_tier="cheap",
+    ),
+    "deepseek-reasoner": ModelInfo(
+        provider="deepseek", model_id="deepseek-reasoner",
+        context_window=128_000, max_output=8_192,
+        supports_tools=False, supports_vision=False,
+        supports_reasoning=True, cost_tier="cheap",
+    ),
+    "deepseek-coder": ModelInfo(
+        provider="deepseek", model_id="deepseek-coder",
+        context_window=128_000, max_output=8_192,
+        supports_tools=True, supports_vision=False,
+        supports_reasoning=False, cost_tier="cheap",
     ),
     # ── Lokale Modelle (Ollama/SGLang) ─────────────────────────────────
     # §193: Target-LLM-Awareness — Fabrik muss wissen was das Ziel-LLM kann
@@ -253,25 +315,42 @@ def get_target_profile(model_id: str) -> TargetLLMProfile:
 # ── Model Aliases ────────────────────────────────────────────────────────
 # Ordered by preference. First available model is used.
 
+# CR-299 (2026-05-05) — Cross-Provider-Diversitaet:
+# Jeder Alias hat jetzt mindestens 3 verschiedene Provider in der Liste.
+# Bei einem Provider-Ausfall (Mistral instabil etc.) greift automatisch
+# der naechste verfuegbare. Vorher: Mistral-lastige Listen mit nur 1
+# Anthropic-Stop, dann wieder Mistral.
 _DEFAULT_ALIASES: dict[str, list[str]] = {
     "strong_reasoning": [
-        "magistral-medium-latest",
-        "claude-sonnet-4-6",
-        "magistral-small-latest",
+        "magistral-medium-latest",            # mistral, primary
+        "claude-sonnet-4-6",                  # anthropic, robust
+        "deepseek-reasoner",                  # deepseek, R1 — guenstig
+        "llama-3.3-70b-versatile",            # groq, schnell
+        "magistral-small-latest",             # mistral fallback
     ],
     "fast_cheap": [
-        "mistral-small-latest",
-        "claude-haiku-4-5",
+        "mistral-small-latest",               # mistral, primary
+        "llama-3.1-8b-instant",               # groq, sehr schnell+guenstig
+        "deepseek-chat",                      # deepseek, V3
+        "claude-haiku-4-5",                   # anthropic
     ],
     "code_gen": [
-        "devstral-latest",
-        "codestral-latest",
-        "claude-sonnet-4-6",
+        "devstral-latest",                    # mistral, primary
+        "deepseek-coder",                     # deepseek, Code-Spezialist
+        "claude-sonnet-4-6",                  # anthropic, robust
+        "codestral-latest",                   # mistral fallback
     ],
     "vision": [
-        "pixtral-large-latest",
-        "pixtral-12b",
-        "claude-sonnet-4-6",
+        "pixtral-large-latest",               # mistral
+        "claude-sonnet-4-6",                  # anthropic — robust bei Vision
+        "pixtral-12b",                        # mistral fallback
+    ],
+    "balanced_worker": [
+        # CR-299: neuer Alias fuer Routine-Aufgaben mit guter Tool-Calling-Qualitaet
+        "mistral-medium-latest",              # mistral, primary
+        "claude-haiku-4-5",                   # anthropic, robust
+        "llama-3.3-70b-versatile",            # groq, schnell
+        "deepseek-chat",                      # deepseek, guenstig
     ],
     "local_fallback": [
         "qwen3.5:32b",

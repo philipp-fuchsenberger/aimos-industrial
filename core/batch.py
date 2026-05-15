@@ -34,6 +34,7 @@ Safety (HAZOP/FMEA/FTA/STPA — docs/snapshots/):
 """
 
 import asyncio
+import json
 import logging
 import shutil
 import time
@@ -360,6 +361,625 @@ def _build_reference_summary(ws_base: Path, max_chars: int = 6000) -> str:
     return "\n".join(parts)
 
 
+# ── Phase 4 Task Modes ────────────────────────────────────────────────────
+
+def _phase4_task_dispatch() -> str:
+    """Phase 4 task prompt for dispatch-mode agents (email, chat).
+    Agent writes plain text → orchestrator dispatches it."""
+    return (
+        "TASK: Write your response as PLAIN TEXT (Fließtext). This text will be sent "
+        "to the stakeholder by the system.\n"
+        "IMPORTANT RULES:\n"
+        "- Write ONLY the response text. Nothing else.\n"
+        "- Do NOT write tool calls, XML tags, code blocks, or JSON.\n"
+        "- Do NOT write <tool_call>, <function=...>, read_file(), or remember().\n"
+        "- Do NOT try to save or store information — just write the response.\n"
+        "- Use the REFERENZDATEN, Lagebild, and Arbeitsdatei Summary as your data source.\n"
+        "- Answer the stakeholder's question directly based on the data provided above.\n"
+        "- ONLY cite facts that appear in the data. Do NOT speculate.\n"
+        "- NEVER mention names, messages, or internal details of other stakeholders."
+    )
+
+
+def _phase4_task_file(agent: "AIMOSAgent") -> str:
+    """Phase 4 task prompt for file-mode — UNUSED when output_assembly is active.
+    Kept as fallback for agents without batch_file_specs."""
+    return "TASK: Erstelle die Output-Dateien gemaess Deinem Arbeitsablauf."
+
+
+FALLBACK_MARKER = "Dokument konnte nicht automatisch analysiert werden"
+
+
+def _is_fallback_section(section_text: str) -> bool:
+    """True iff the section is only a fallback stub (no real analysis)."""
+    return FALLBACK_MARKER in section_text and len(section_text.strip()) < 250
+
+
+def _doc_has_real_analysis(arbeitsdatei_text: str, doc_name: str) -> bool:
+    """True iff doc_name has a real (non-fallback) section in arbeitsdatei.
+
+    A fallback stub counts as "not processed" so the next cycle can retry.
+    """
+    import re as _re_real
+    if f"## {doc_name}" not in arbeitsdatei_text:
+        return False
+    for p in _re_real.split(r"\n(?=## )", arbeitsdatei_text):
+        title = p.split("\n")[0].strip("# ").strip()
+        if title == doc_name:
+            return not _is_fallback_section(p)
+    return False
+
+
+def _remove_fallback_section(arbeitsdatei_path: Path, doc_name: str) -> bool:
+    """Remove a fallback stub section for doc_name from arbeitsdatei.md.
+
+    Returns True if a fallback section was removed.
+    """
+    import re as _re_rm
+    if not arbeitsdatei_path.exists():
+        return False
+    text = arbeitsdatei_path.read_text(encoding="utf-8")
+    parts = _re_rm.split(r"(\n(?=## ))", text)  # capture separators to rebuild
+    out = []
+    removed = False
+    i = 0
+    while i < len(parts):
+        chunk = parts[i]
+        title = chunk.lstrip("\n").split("\n", 1)[0].strip("# ").strip()
+        if title == doc_name and _is_fallback_section(chunk):
+            removed = True
+            i += 1
+            if i < len(parts) and parts[i].startswith("\n"):
+                i += 1  # skip the captured "\n" separator that followed the removed block
+            continue
+        out.append(chunk)
+        i += 1
+    if removed:
+        arbeitsdatei_path.write_text("".join(out), encoding="utf-8")
+    return removed
+
+
+def _list_input_filenames(ws_base: Path) -> set[str]:
+    """Return the set of filenames currently in the agent's input/ directory.
+
+    Used as whitelist for arbeitsdatei section detection. If input/ does not
+    exist (or scan dir is configured differently), returns an empty set —
+    callers treat that as "no whitelist, accept anything that passes the
+    other heuristics".
+    """
+    input_dir = ws_base / "input"
+    if not input_dir.is_dir():
+        return set()
+    return {p.name for p in input_dir.iterdir() if p.is_file()}
+
+
+def _sanitize_chunk_result(result: str) -> str:
+    """Strip leading `## ` headers from a chunk-analysis result.
+
+    LLMs sometimes prepend their own `## Analyseergebnis fuer Dokument: ...`
+    header, which the section splitter would later misread as a separate
+    document section. The harness owns section headers — the LLM's analysis
+    body must not introduce new ones.
+
+    Demotes any `## ` line to `### ` so structural Markdown stays readable
+    but cannot create false sections.
+    """
+    out: list[str] = []
+    for line in result.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("## ") and not stripped.startswith("### "):
+            out.append(line.replace("## ", "### ", 1))
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _split_arbeitsdatei_doc_sections(
+    content: str, expected_filenames: set[str] | None = None,
+) -> list[str]:
+    """Split arbeitsdatei.md content into document sections.
+
+    Single source of truth for "what counts as a document section".
+    Used by Output Assembly and the Completion Check so they cannot drift.
+
+    A document section:
+      - starts with `## ` (after strip), so the empty preamble before the first
+        `## ` and any leading blank block from re.split are excluded;
+      - has at least 50 chars of content (filters out near-empty stubs);
+      - has a title containing `.` or `__` (filters out LLM-generated headings
+        like `## A. Technische Dokumentation`);
+      - if `expected_filenames` is given, the title must match one of them
+        exactly — defends against LLM-injected fake headers like
+        `## Analyseergebnis fuer Dokument: **Foo.md**` slipping through.
+    """
+    import re as _re_split
+    out: list[str] = []
+    for s in _re_split.split(r"\n(?=## )", content):
+        stripped = s.strip()
+        if not stripped.startswith("## ") or len(stripped) < 50:
+            continue
+        title = s.split("\n")[0].strip("# ").strip()
+        if "." not in title and "__" not in title:
+            continue
+        if expected_filenames is not None and title not in expected_filenames:
+            continue
+        out.append(s)
+    return out
+
+
+def _check_file_mode_completion(
+    agent: "AIMOSAgent", ws_base: Path, log: logging.Logger,
+) -> dict:
+    """State-based completion check for file-mode agents.
+
+    Returns dict with:
+      complete: bool — True if all output files exist and are valid
+      reason: str — why it's incomplete (for retrigger message)
+      docs_in_arbeitsdatei: int — sections in arbeitsdatei
+      docs_in_inventar: int — entries in inventar JSON
+      output_files: list — which output files were checked
+    """
+    result = {"complete": False, "reason": "", "docs_in_arbeitsdatei": 0,
+              "docs_in_inventar": 0, "output_files": []}
+
+    _file_specs = agent.config.get("batch_file_specs", {})
+    _output_files = [f for f in _file_specs.keys() if f != "arbeitsdatei.md"]
+    result["output_files"] = _output_files
+
+    # 1. arbeitsdatei must exist and have content
+    _arbeitsdatei = ws_base / "arbeitsdatei.md"
+    if not _arbeitsdatei.exists() or _arbeitsdatei.stat().st_size < 100:
+        result["reason"] = "no_arbeitsdatei"
+        return result
+
+    # Count document sections in arbeitsdatei (shared helper with Output Assembly).
+    # Pass the actual input filenames as whitelist so LLM-injected fake `## ` headers
+    # cannot inflate the count.
+    _ad_text = _arbeitsdatei.read_text(encoding="utf-8")
+    _expected_names = _list_input_filenames(ws_base)
+    _ad_sections = len(_split_arbeitsdatei_doc_sections(_ad_text, _expected_names))
+    result["docs_in_arbeitsdatei"] = _ad_sections
+
+    # 2. All output files must exist
+    _missing = [f for f in _output_files if not (ws_base / f).exists()]
+    if _missing:
+        result["reason"] = f"Fehlende Output-Dateien: {', '.join(_missing)}"
+        return result
+
+    # 3. Validate each output file against its spec
+    for fname in _output_files:
+        fpath = ws_base / fname
+        if fpath.stat().st_size < 10:
+            result["reason"] = f"{fname} ist leer"
+            return result
+
+        _spec_marker = _file_specs.get(fname, "")
+        if _spec_marker:
+            _fcontent = fpath.read_text(encoding="utf-8")
+            if _spec_marker not in _fcontent:
+                result["reason"] = f"{fname} enthält nicht den erwarteten Marker"
+                return result
+
+    # 4. For JSON inventar: check document count matches arbeitsdatei
+    for fname in _output_files:
+        if fname.endswith(".json"):
+            fpath = ws_base / fname
+            try:
+                _inv = json.loads(fpath.read_text(encoding="utf-8"))
+                _inv_docs = len(_inv.get("dokumente", []))
+                result["docs_in_inventar"] = _inv_docs
+                if _ad_sections > 0 and _inv_docs < _ad_sections:
+                    result["reason"] = (
+                        f"{fname} hat {_inv_docs} Dokumente, "
+                        f"arbeitsdatei hat {_ad_sections} Abschnitte"
+                    )
+                    return result
+            except (json.JSONDecodeError, KeyError):
+                result["reason"] = f"{fname} ist kein valides JSON"
+                return result
+
+    result["complete"] = True
+    return result
+
+
+def _load_valid_anhang_iv(ws_base: Path) -> set[str]:
+    """Load valid Anhang-IV IDs from the reference checklist file (Single Source of Truth)."""
+    import re as _re_aiv
+    for ref_dir in [ws_base / "reference", ws_base / "team_reference"]:
+        for fname in ["anhang_IV_checkliste.md", "anhang_iv_anforderungen.md"]:
+            ref_file = ref_dir / fname
+            if ref_file.exists():
+                ids = set()
+                for m in _re_aiv.finditer(r"id:\s*(\S+)", ref_file.read_text(encoding="utf-8")):
+                    ids.add(m.group(1))
+                if ids:
+                    return ids
+    return set()  # No checklist found — skip validation
+
+
+def _load_valid_types(ws_base: Path) -> list[str]:
+    """Load valid document types from dokumenttypen.yaml (Single Source of Truth).
+
+    Extracts all subtype entries from the YAML catalog.
+    Falls back to empty list if no catalog found (= no type constraint in prompt).
+    """
+    import re as _re_typ
+    for ref_dir in [ws_base / "team_reference", ws_base / "reference"]:
+        for fname in ["dokumenttypen.yaml", "dokumenttypen.yml"]:
+            f = ref_dir / fname
+            if f.exists():
+                types = []
+                for m in _re_typ.finditer(r"^\s+-\s+(\w+)", f.read_text(encoding="utf-8"), _re_typ.MULTILINE):
+                    typ = m.group(1)
+                    if typ not in ("subtypen",):  # Skip YAML keys
+                        types.append(typ)
+                if types:
+                    return sorted(set(types))
+    return []
+
+
+def _normalize_entry(
+    entry: dict, valid_analysts: set, valid_anhang_iv: set,
+    valid_types: list[str],
+    log: logging.Logger, agent_name: str,
+) -> dict:
+    """Harness-level normalization of LLM-generated inventory entries."""
+    import re as _re_norm
+    # Normalize ID: DOK-009 → DOK-09, DOK-002 → DOK-02
+    raw_id = entry.get("id", "")
+    m = _re_norm.match(r"DOK-0*(\d+)", raw_id)
+    if m:
+        num = int(m.group(1))
+        entry["id"] = f"DOK-{num:02d}"
+        if entry["id"] != raw_id:
+            log.info(f"[{agent_name}] Normalize ID: {raw_id} → {entry['id']}")
+
+    # Normalize dateiname: ensure it starts with DOK-NN_
+    dateiname = entry.get("dateiname", "")
+    if dateiname and not dateiname.startswith("DOK-"):
+        entry["dateiname"] = f"{entry['id']}_{dateiname}"
+
+    # Filter invalid Anhang-IV IDs (loaded from reference checklist)
+    raw_zuordnung = entry.get("anhang_iv_zuordnung", [])
+    valid_zuordnung = [a for a in raw_zuordnung if a in valid_anhang_iv] if valid_anhang_iv else raw_zuordnung
+    if len(valid_zuordnung) != len(raw_zuordnung):
+        removed = set(raw_zuordnung) - set(valid_zuordnung)
+        log.info(f"[{agent_name}] {entry['id']}: Removed invalid Anhang-IV IDs: {removed}")
+    entry["anhang_iv_zuordnung"] = valid_zuordnung
+
+    # Validate document type against catalog
+    if valid_types:
+        raw_typ = entry.get("typ", "sonstiges")
+        if raw_typ not in valid_types:
+            # Try lowercase/normalized match
+            match = None
+            raw_lower = raw_typ.lower().replace("-", "_").replace(" ", "_")
+            for vt in valid_types:
+                if vt == raw_lower or raw_lower.startswith(vt) or vt.startswith(raw_lower):
+                    match = vt
+                    break
+            if match:
+                log.info(f"[{agent_name}] {entry['id']}: Typ {raw_typ} → {match}")
+                entry["typ"] = match
+            else:
+                log.warning(f"[{agent_name}] {entry['id']}: Unknown typ '{raw_typ}', keeping as-is")
+
+    # Normalize analyst names
+    if valid_analysts:
+        raw_analysts = entry.get("relevant_fuer", [])
+        normalized = []
+        for a in raw_analysts:
+            if a in valid_analysts:
+                normalized.append(a)
+            else:
+                # Fuzzy match: mca_elektro/mca_elec → mca_elek
+                best = None
+                for va in valid_analysts:
+                    if a[:6] == va[:6]:  # Same prefix after mca_
+                        best = va
+                        break
+                if best:
+                    log.info(f"[{agent_name}] {entry['id']}: Analyst {a} → {best}")
+                    normalized.append(best)
+                else:
+                    log.warning(f"[{agent_name}] {entry['id']}: Unknown analyst '{a}', dropped")
+        entry["relevant_fuer"] = normalized
+
+    # Ensure pfad field
+    if "pfad" not in entry or entry["pfad"] in ("N/A", "", None):
+        entry["pfad"] = f"input/{entry.get('dateiname', '')}"
+
+    # Ensure begruendung field — always present so consumers can rely on it
+    if not entry.get("begruendung"):
+        entry["begruendung"] = ""
+        log.warning(f"[{agent_name}] {entry['id']}: begruendung fehlt im LLM-Output")
+
+    return entry
+
+
+async def _phase4_output_assembly(
+    agent: "AIMOSAgent", ws_base: Path, log: logging.Logger,
+) -> list[dict]:
+    """Phase 4 Output Assembly — Harness baut, LLM entscheidet klein.
+
+    1. arbeitsdatei.md in Abschnitte splitten (## Separatoren)
+    2. Pro Abschnitt: 1 kleiner LLM-Call → 1 JSON-Entry
+    3. Harness assembliert deterministisch → dokumenten_inventar.json
+    4. Gap-Analyse deterministisch → maengelliste.md
+    """
+    arbeitsdatei = ws_base / "arbeitsdatei.md"
+    if not arbeitsdatei.exists() or arbeitsdatei.stat().st_size < 100:
+        log.warning(f"[{agent.agent_name}] Output Assembly: arbeitsdatei leer/fehlt")
+        return []
+
+    content = arbeitsdatei.read_text(encoding="utf-8")
+
+    # 1. Splitten nach ## Dokument-Abschnitten (gemeinsame Logik mit Completion-Check)
+    import re as _re_oa
+    _all_sections = _re_oa.split(r"\n(?=## )", content)
+    _expected_names = _list_input_filenames(ws_base)
+    doc_sections = _split_arbeitsdatei_doc_sections(content, _expected_names)
+    _skipped = 0
+    for s in _all_sections:
+        stripped = s.strip()
+        if not stripped.startswith("## ") or len(stripped) < 50:
+            continue
+        title = s.split("\n")[0].strip("# ").strip()
+        if "." not in title and "__" not in title:
+            _skipped += 1
+    if _skipped:
+        log.info(f"[{agent.agent_name}] Output Assembly: {_skipped} LLM-generierte Abschnitte uebersprungen")
+    log.info(f"[{agent.agent_name}] Output Assembly: {len(doc_sections)} Dokument-Abschnitte in arbeitsdatei")
+
+    if not doc_sections:
+        log.warning(f"[{agent.agent_name}] Output Assembly: Keine ## Abschnitte gefunden")
+        return []
+
+    # 2. Lade gültige Analysten-Namen aus Mapping-Datei
+    _valid_analysts = set()
+    for ref_dir in [ws_base / "reference", ws_base / "team_reference"]:
+        for fname in ["analysten_mapping.md", "analysten_zuordnung.md"]:
+            _mapping_file = ref_dir / fname
+            if _mapping_file.exists():
+                for _line in _mapping_file.read_text(encoding="utf-8").splitlines():
+                    _m = _re_oa.match(r"\|\s*(mca_\w+)\s*\|", _line)
+                    if _m:
+                        _valid_analysts.add(_m.group(1))
+                break
+        if _valid_analysts:
+            break
+    _analysts_str = ", ".join(sorted(_valid_analysts)) if _valid_analysts else ""
+
+    # Lade gültige Anhang-IV IDs aus Referenz-Checkliste
+    _valid_anhang_iv = _load_valid_anhang_iv(ws_base)
+    _anhang_iv_str = ", ".join(sorted(_valid_anhang_iv)) if _valid_anhang_iv else ""
+
+    # Lade gültige Dokumenttypen aus Katalog
+    _valid_types = _load_valid_types(ws_base)
+    _types_str = ", ".join(_valid_types) if _valid_types else ""
+    log.info(f"[{agent.agent_name}] Output Assembly: {len(_valid_anhang_iv)} Anhang-IV IDs, {len(_valid_analysts)} Analysten, {len(_valid_types)} Dokumenttypen geladen")
+
+    # Pro Abschnitt: LLM generiert EINEN JSON-Eintrag
+    # W5 (Stable Doc-IDs): wenn Config-Flag gesetzt, Hash-basierte IDs.
+    # Sonst Sequential (rueckwaerts-kompatibel).
+    _use_stable_ids = bool(agent.config.get("stable_doc_ids", False))
+    _stable_id_map: dict[str, str] = {}
+    if _use_stable_ids:
+        try:
+            from core.stable_doc_ids import assign_stable_ids
+            file_dicts = []
+            for s in doc_sections:
+                title = s.split("\n")[0].strip("# ").strip()
+                file_dicts.append({"dateiname": title, "size_bytes": len(s)})
+            _stable_id_map = assign_stable_ids(file_dicts)
+            log.info(f"[{agent.agent_name}] W5 stable_doc_ids: {len(_stable_id_map)} IDs zugeordnet")
+        except Exception as exc:
+            log.warning(f"[{agent.agent_name}] stable_doc_ids fehlgeschlagen, fallback: {exc}")
+            _stable_id_map = {}
+
+    entries = []
+    for idx, section in enumerate(doc_sections):
+        section_title = section.split("\n")[0].strip("# ").strip()
+        # Deterministic ID assignment by harness (not LLM)
+        if _stable_id_map:
+            _harness_doc_id = _stable_id_map.get(section_title) or f"DOK-{idx+1:04d}"
+        else:
+            _harness_doc_id = f"DOK-{idx+1:04d}"
+        log.info(f"[{agent.agent_name}] Output Assembly: Entry {idx+1}/{len(doc_sections)}: {_harness_doc_id} ← {section_title[:40]}")
+
+        # Build constraint lines from loaded reference data (Single Source of Truth)
+        _constraints = []
+        _constraints.append(f"- id: Verwende exakt diese ID: {_harness_doc_id}")
+        if _types_str:
+            _constraints.append(f"- typ: NUR diese Werte erlaubt: {_types_str}")
+        else:
+            _constraints.append("- typ: Freitext-Klassifikation des Dokumenttyps")
+        _constraints.append("- aktuell: false wenn aelter als 2 Jahre oder veraltete Norm")
+        if _anhang_iv_str:
+            _constraints.append(f"- anhang_iv_zuordnung: NUR diese Werte erlaubt: {_anhang_iv_str}")
+        if _analysts_str:
+            _constraints.append(f"- relevant_fuer: NUR diese Werte erlaubt: {_analysts_str}")
+        _constraints.append("- Antworte NUR mit dem JSON-Objekt, kein Markdown, kein Text.")
+
+        entry_prompt = (
+            "Erstelle aus dieser Dokumentenanalyse EINEN JSON-Eintrag.\n\n"
+            f"ANALYSE:\n{section[:3000]}\n\n"
+            "FORMAT (antworte NUR mit diesem JSON, nichts anderes):\n"
+            '{"id": "DOK-NN", "dateiname": "...", "typ": "...", '
+            '"revision": "...", "datum": "YYYY-MM-DD", "aktuell": true, '
+            '"anhang_iv_zuordnung": ["A.1"], "relevant_fuer": ["mca_mech"], '
+            '"warnungen": ["..."], '
+            '"begruendung": "Warum dieser Typ und diese Aktualitaets-Bewertung"}\n\n'
+            "Regeln:\n" + "\n".join(_constraints)
+            + "\n- begruendung: 1-2 Saetze die erklaeren WARUM dieser Typ und aktuell/veraltet"
+        )
+
+        try:
+            with _PhaseParams(agent, "phase4", log):
+                result = await _think_with_activity_check(
+                    agent, entry_prompt, log,
+                    stale_timeout=30,  # Kurzer Timeout pro Entry
+                    phase="4",
+                )
+            # Parse JSON from result
+            result = result.strip()
+            # Detect LLM refusal and retry with simplified prompt
+            _is_refusal = any(kw in result.lower() for kw in [
+                "entschuldigung", "kann ich nicht", "kann diese anfrage nicht",
+                "wende dich an", "i cannot", "i'm sorry",
+            ])
+            if _is_refusal:
+                log.warning(f"[{agent.agent_name}] Output Assembly: LLM refusal for {section_title[:30]}, retrying with simplified prompt")
+                _retry_prompt = (
+                    "Klassifiziere dieses Dokument als JSON.\n\n"
+                    f"Titel: {section_title}\n"
+                    f"Inhalt (Auszug): {section[:1500]}\n\n"
+                    "Antwort NUR als JSON: "
+                    '{"id": "DOK-NN", "dateiname": "...", "typ": "...", '
+                    '"revision": "...", "datum": "...", "aktuell": true, '
+                    '"anhang_iv_zuordnung": [], "relevant_fuer": [], "warnungen": [], '
+                    '"begruendung": "kurze Begruendung"}'
+                )
+                try:
+                    with _PhaseParams(agent, "phase4", log):
+                        result = await _think_with_activity_check(
+                            agent, _retry_prompt, log, stale_timeout=30, phase="4",
+                        )
+                    result = result.strip()
+                except Exception as exc:
+                    log.warning(f"[{agent.agent_name}] Output Assembly: Retry also failed: {exc}")
+
+            # Strip markdown fences
+            if result.startswith("```"):
+                result = _re_oa.sub(r"^```\w*\n?", "", result)
+                result = _re_oa.sub(r"\n?```$", "", result.strip())
+            try:
+                entry = json.loads(result)
+                if isinstance(entry, dict):
+                    entry["id"] = _harness_doc_id  # Harness-assigned ID overrides LLM
+                    entry = _normalize_entry(entry, _valid_analysts, _valid_anhang_iv, _valid_types, log, agent.agent_name)
+                    entries.append(entry)
+                    log.info(f"[{agent.agent_name}] Output Assembly: {entry['id']}: {entry.get('typ')}")
+                else:
+                    log.warning(f"[{agent.agent_name}] Output Assembly: Kein valides Entry: {result[:100]}")
+            except json.JSONDecodeError:
+                # Retry: Versuch JSON aus dem Text zu extrahieren
+                m = _re_oa.search(r"\{[^{}]*\}", result, _re_oa.DOTALL)
+                if m:
+                    try:
+                        entry = json.loads(m.group())
+                        entry["id"] = _harness_doc_id  # Harness-assigned ID overrides LLM
+                        entry = _normalize_entry(entry, _valid_analysts, _valid_anhang_iv, _valid_types, log, agent.agent_name)
+                        entries.append(entry)
+                        log.info(f"[{agent.agent_name}] Output Assembly: {entry['id']} (extracted)")
+                    except json.JSONDecodeError:
+                        log.warning(f"[{agent.agent_name}] Output Assembly: JSON parse failed: {result[:100]}")
+                else:
+                    log.warning(f"[{agent.agent_name}] Output Assembly: Kein JSON in Antwort: {result[:100]}")
+        except Exception as exc:
+            log.warning(f"[{agent.agent_name}] Output Assembly: LLM-Call failed: {exc}")
+
+    log.info(f"[{agent.agent_name}] Output Assembly: {len(entries)}/{len(doc_sections)} Entries generiert")
+
+    # 3. Harness assembliert deterministisch
+    # Gap-Analyse: Welche Anhang-IV Punkte sind abgedeckt?
+    covered = set()
+    for entry in entries:
+        for aid in entry.get("anhang_iv_zuordnung", []):
+            covered.add(aid)
+
+    # Lade Anhang-IV Checkliste für fehlende Punkte
+    checklist_items = []
+    for ref_dir in [ws_base / "reference", ws_base / "team_reference"]:
+        for fname in ["anhang_IV_checkliste.md", "anhang_iv_anforderungen.md"]:
+            ref_file = ref_dir / fname
+            if ref_file.exists():
+                ref_text = ref_file.read_text(encoding="utf-8")
+                # Parse YAML-like entries: "- id: A.1\n    name: ..."
+                for m in _re_oa.finditer(r"id:\s*(\S+)\s*\n\s*name:\s*\"?([^\"]+)\"?", ref_text):
+                    checklist_items.append({"id": m.group(1), "name": m.group(2).strip()})
+                break
+        if checklist_items:
+            break
+
+    all_required = set(item["id"] for item in checklist_items)
+    missing = all_required - covered
+
+    # Projektname aus status.json oder firma_profil.md laden
+    # ws_base = storage/agents/<name>/, Workspace = workspaces/<name>/
+    _aimos_root = ws_base.parent.parent.parent  # /opt/AIMOS/storage/agents/<name> → /opt/AIMOS
+    _ws_dir = _aimos_root / "workspaces" / agent.agent_name
+    _projekt_name = agent.agent_name
+    for _sf in [_ws_dir / "status.json", ws_base / "status.json"]:
+        if _sf.exists():
+            try:
+                _sj = json.loads(_sf.read_text(encoding="utf-8"))
+                _projekt_name = _sj.get("projekt_id") or _sj.get("maschine") or _projekt_name
+                if _projekt_name != agent.agent_name:
+                    break
+            except (json.JSONDecodeError, KeyError):
+                pass
+    if _projekt_name == agent.agent_name:
+        for _pf in [_ws_dir / "firma_profil.md", ws_base / "firma_profil.md"]:
+            if _pf.exists():
+                _pf_text = _pf.read_text(encoding="utf-8")
+                _pm = _re_oa.search(r"(?:Projekt-ID|Maschine)[:\s]*(.+)", _pf_text)
+                if _pm:
+                    _projekt_name = _pm.group(1).strip()
+                    break
+
+    inventar = {
+        "projekt": _projekt_name,
+        "stand": __import__("datetime").date.today().isoformat(),
+        "datenquellen_durchsucht": 1,
+        "dokumente_gesamt": len(entries),
+        "dokumente": entries,
+        "gap_analyse": {
+            "vorhanden": sorted(covered),
+            "fehlend": [
+                {"id": mid, "grund": next(
+                    (i["name"] for i in checklist_items if i["id"] == mid),
+                    f"{mid} fehlt"
+                )}
+                for mid in sorted(missing)
+            ],
+        },
+    }
+
+    # Schreibe Inventar (deterministisch)
+    inventar_path = ws_base / "dokumenten_inventar.json"
+    inventar_path.write_text(json.dumps(inventar, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    log.info(f"[{agent.agent_name}] Output Assembly: dokumenten_inventar.json geschrieben ({len(entries)} Dokumente)")
+
+    # 4. Mängelliste deterministisch
+    lines = ["# Maengelliste\n"]
+    lines.append("| Prioritaet | Anhang-IV | Was fehlt | Status |")
+    lines.append("|:----------:|:---------:|-----------|--------|")
+    for item in inventar["gap_analyse"]["fehlend"]:
+        aid = item["id"]
+        if aid.startswith("B") or aid.startswith("C"):
+            prio = "HOCH"
+        elif aid.startswith("D") or aid.startswith("E"):
+            prio = "HOCH"
+        elif aid.startswith("A"):
+            prio = "MITTEL"
+        else:
+            prio = "NIEDRIG"
+        lines.append(f"| {prio} | {aid} | {item['grund']} | OFFEN |")
+    # Auch veraltete Dokumente aufnehmen
+    for entry in entries:
+        if not entry.get("aktuell", True):
+            lines.append(f"| HOCH | — | {entry.get('id','?')}: {entry.get('typ','?')} ist VERALTET | AKTUALISIERUNG |")
+        for w in entry.get("warnungen", []):
+            lines.append(f"| MITTEL | — | {entry.get('id','?')}: {w} | KLAERUNG |")
+
+    maengel_path = ws_base / "maengelliste.md"
+    maengel_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    log.info(f"[{agent.agent_name}] Output Assembly: maengelliste.md geschrieben ({len(lines)-3} Eintraege)")
+
+    return [{"action": "output_assembly", "entries": len(entries), "missing": len(missing)}]
+
+
 # ── CR-279: Draft Safety (universal + agent-specific hooks) ────────────────
 
 def _apply_draft_safety(
@@ -490,12 +1110,18 @@ def _scan_workspace_documents(ws_base: Path, log: logging.Logger, agent_name: st
     subdirectory (or client subdirs like klient_*/dokumente/).
     A file is considered processed if its name appears in arbeitsdatei.md or state.md.
     """
-    doc_dirs = [ws_base / "dokumente"]
+    # CR-258+: Configurable scan directories via batch_data_sources
+    # Default: "dokumente/" (steuerberater pattern)
+    # MCA pattern: "input/" (customer documents)
+    doc_dir_names = ["dokumente", "input"]  # scan both by default
+    doc_dirs = [ws_base / d for d in doc_dir_names]
     # Also check client subdirectories (steuerberater pattern: klient_*/dokumente/)
     if ws_base.exists():
         for d in ws_base.iterdir():
             if d.is_dir() and (d / "dokumente").is_dir():
                 doc_dirs.append(d / "dokumente")
+            if d.is_dir() and (d / "input").is_dir():
+                doc_dirs.append(d / "input")
 
     # Auto-extract archives before scanning
     for doc_dir in doc_dirs:
@@ -520,19 +1146,18 @@ def _scan_workspace_documents(ws_base: Path, log: logging.Logger, agent_name: st
     if not documents:
         return []
 
-    # Check which are already processed — ONLY check arbeitsdatei.md
-    # (state.md may mention filenames in setup text without having processed them)
+    # Check which are already processed — ONLY check arbeitsdatei.md.
+    # A fallback stub counts as NOT processed so the next cycle can retry.
     processed_names = set()
-    for check_file in ["arbeitsdatei.md"]:
-        check_path = ws_base / check_file
-        if check_path.exists():
-            try:
-                content = check_path.read_text(encoding="utf-8")
-                for doc in documents:
-                    if doc["name"] in content:
-                        processed_names.add(doc["name"])
-            except Exception:
-                pass
+    check_path = ws_base / "arbeitsdatei.md"
+    if check_path.exists():
+        try:
+            content = check_path.read_text(encoding="utf-8")
+            for doc in documents:
+                if _doc_has_real_analysis(content, doc["name"]):
+                    processed_names.add(doc["name"])
+        except Exception:
+            pass
 
     new_docs = [d for d in documents if d["name"] not in processed_names]
     if new_docs:
@@ -540,6 +1165,44 @@ def _scan_workspace_documents(ws_base: Path, log: logging.Logger, agent_name: st
             f"[{agent_name}] CR-258 Workspace scan: {len(new_docs)} new document(s) "
             f"({len(documents)} total, {len(processed_names)} already processed)"
         )
+
+    # K1 Defense-in-depth: HR-/Personal-/Lohn-Daten 2nd-layer-Pruefung.
+    # Default an fuer mca_*-Agenten; per Config deaktivierbar.
+    if agent_name.startswith("mca_") and new_docs:
+        try:
+            from core.data_protection import filter_input_files
+            input_dir = ws_base / "input"
+            file_dicts = [
+                {"pfad": str(d.get("path", "")), "dateiname": d["name"]}
+                for d in new_docs
+            ]
+            ok, blocked = filter_input_files(
+                file_dicts,
+                workspace_input_dir=input_dir if input_dir.is_dir() else None,
+                log=log,
+            )
+            if blocked:
+                blocked_names = {b["dateiname"] for b in blocked}
+                new_docs = [d for d in new_docs if d["name"] not in blocked_names]
+                log.warning(
+                    f"[{agent_name}] K1 Data-Protection: {len(blocked)} Datei(en) "
+                    f"blockiert: {[b['dateiname'] for b in blocked]}"
+                )
+                # Audit-Log fuer Datenschutz-Vorfall
+                try:
+                    from core.audit import log_event
+                    for b in blocked:
+                        log_event(
+                            ws_base, agent=agent_name,
+                            action="data_protection_block",
+                            target=b["dateiname"], result="blocked",
+                            details={"grund": b.get("block_grund", "")},
+                        )
+                except Exception:
+                    pass
+        except ImportError:
+            pass
+
     return new_docs
 
 
@@ -892,7 +1555,12 @@ async def process_batch(agent: "AIMOSAgent", messages: list[dict], log: logging.
     # ══════════════════════════════════════════════════════════════════════
     #  Phase 3: DECIDE — Stakeholder plan
     # ══════════════════════════════════════════════════════════════════════
-    stakeholder_plan = await _phase3_decide(agent, lagebild, messages, log)
+    if agent.config.get("batch_phase4_mode") == "file":
+        # File-mode: No stakeholders to dispatch to — skip Phase 3
+        stakeholder_plan = ""
+        log.info(f"[{agent.agent_name}] Phase 3 SKIPPED (file-mode, no stakeholder dispatch)")
+    else:
+        stakeholder_plan = await _phase3_decide(agent, lagebild, messages, log)
 
     # ══════════════════════════════════════════════════════════════════════
     #  Phase 4: ACT — Draft → Validate → Dispatch (Orchestrator)
@@ -921,6 +1589,35 @@ async def process_batch(agent: "AIMOSAgent", messages: list[dict], log: logging.
         log.info(f"[{agent.agent_name}] Phase 5 PERSIST skipped (batch_persist=false)")
 
     agent._touch()
+
+    # File-mode: State-based completion check → self-retrigger if incomplete
+    if agent.config.get("batch_phase4_mode") == "file":
+        _completion = _check_file_mode_completion(agent, ws_base, log)
+        if _completion["complete"]:
+            log.info(
+                f"[{agent.agent_name}] File-mode: COMPLETE — "
+                f"{_completion['docs_in_inventar']}/{_completion['docs_in_arbeitsdatei']} docs, "
+                f"all {len(_completion['output_files'])} output files valid."
+            )
+        elif _completion["reason"] == "no_arbeitsdatei":
+            log.info(f"[{agent.agent_name}] File-mode: arbeitsdatei not ready yet, no retrigger")
+        else:
+            log.info(
+                f"[{agent.agent_name}] File-mode: INCOMPLETE — {_completion['reason']}. "
+                f"Self-retrigger for next cycle."
+            )
+            try:
+                if agent._pool:
+                    await agent._pool.execute(
+                        "INSERT INTO pending_messages (agent_name, sender_id, content, kind) "
+                        "VALUES ($1, '0', $2, 'internal')",
+                        agent.agent_name,
+                        f"Weiterarbeiten: {_completion['reason']}. "
+                        f"Die Analyseergebnisse stehen in arbeitsdatei.md.",
+                    )
+                    log.info(f"[{agent.agent_name}] Self-retrigger message inserted")
+            except Exception as exc:
+                log.warning(f"[{agent.agent_name}] Self-retrigger failed: {exc}")
 
     # Auto-followup for the batch as a whole
     if first_msg.get("kind") not in ("scheduled_job", "internal"):
@@ -1408,6 +2105,21 @@ async def _phase4_act(
 
     phase3_results: list[dict] = []
 
+    # ══ File-mode Output Assembly: Harness baut, LLM entscheidet klein ══
+    if agent.config.get("batch_phase4_mode") == "file":
+        _arbeitsdatei = _ws / "arbeitsdatei.md"
+        if _arbeitsdatei.exists() and _arbeitsdatei.stat().st_size > 100:
+            log.info(f"[{agent.agent_name}] Phase 4: Output Assembly (file-mode)")
+            try:
+                assembly_results = await _phase4_output_assembly(agent, _ws, log)
+                phase3_results.extend(assembly_results)
+            except Exception as exc:
+                log.error(f"[{agent.agent_name}] Phase 4 Output Assembly FAILED: {exc}")
+            # Skip normal stakeholder loop — output is already written
+            # Jump to Phase 5 (via the normal code path after the loop)
+            threads = {}  # Empty → skip stakeholder loop
+            proactive_threads = {}  # Empty → skip proactive loop
+
     for thread_id, thread_msgs in threads.items():
         representative_msg = thread_msgs[0]
 
@@ -1477,17 +2189,11 @@ async def _phase4_act(
             f"CURRENT MESSAGE(S) from this stakeholder ({sender_info}, channel={channel_info}):\n"
             f"{msg_contents}\n\n"
             f"{_summary_block}"
-            "TASK: Write your response as PLAIN TEXT (Fließtext). This text will be sent "
-            "to the stakeholder by the system.\n"
-            "IMPORTANT RULES:\n"
-            "- Write ONLY the response text. Nothing else.\n"
-            "- Do NOT write tool calls, XML tags, code blocks, or JSON.\n"
-            "- Do NOT write <tool_call>, <function=...>, read_file(), or remember().\n"
-            "- Do NOT try to save or store information — just write the response.\n"
-            "- Use the REFERENZDATEN, Lagebild, and Arbeitsdatei Summary as your data source.\n"
-            "- Answer the stakeholder's question directly based on the data provided above.\n"
-            "- ONLY cite facts that appear in the data. Do NOT speculate.\n"
-            "- NEVER mention names, messages, or internal details of other stakeholders."
+            # Phase 4 mode: "dispatch" (default) vs "file"
+            # dispatch: Agent writes plain text → orchestrator sends it
+            # file: Agent uses write_file to create output files
+            + (_phase4_task_file(agent) if agent.config.get("batch_phase4_mode") == "file"
+               else _phase4_task_dispatch())
         )
 
         log.info(
@@ -1499,7 +2205,9 @@ async def _phase4_act(
                 result = await _think_with_activity_check(
                     agent, phase3_prompt, log,
                     stale_timeout=agent.config.get("batch_stale_timeout", 120),
-                    phase="4a",  # 4a DRAFT — READ only (no WRITE, no COMMUNICATE)
+                    # file-mode: Phase "4" (full ACT, write_file allowed)
+                    # dispatch-mode: Phase "4a" (DRAFT, READ only)
+                    phase="4" if agent.config.get("batch_phase4_mode") == "file" else "4a",
                 )
             log.info(f"[{agent.agent_name}] BATCH Phase 4a DRAFT thread={thread_id} complete: {len(result)} chars")
 
@@ -1985,22 +2693,40 @@ async def _phase2a_documents(
             chunk_prompt += (
                 f"DOCUMENT: {doc_name} (chunk {i+1}/{len(chunks)})\n"
                 f"{'='*40}\n{chunk}\n{'='*40}\n\n"
-                "Analyze this document chunk thoroughly.\n"
-                "For EACH entry/item/line in the document, output ONE LINE in this exact format:\n"
-                "| Datum | Beschreibung | Betrag | Kategorie | §EStG | Status |\n\n"
-                "Example:\n"
-                "| 16.02.2025 | PINKCAT Tastatur+Maus Set | 25,99€ | Werbungskosten/Arbeitsmittel | §9 | kategorisiert |\n"
-                "| 23.10.2025 | Miele Backofen-Reparatur (Arbeitsanteil) | 238,37€ | Handwerkerleistung | §35a | kategorisiert |\n\n"
-                "Status values: kategorisiert / unklar / privat / nachfragen\n"
-                "If unclear whether private or business: set status to 'nachfragen'.\n"
-                "For Handwerker invoices: SEPARATE material costs from labor costs.\n"
-                "PLAUSIBILITY: If you categorize Bankentgelte/Kontoführungsgebühren >500€ total, flag as 'nachfragen'. The typical Kontoführungspauschale is only 16€. Large amounts are likely misclassified normal transactions.\n"
-                "SPECIAL CASES: Check mandant_profil.md for special circumstances (disabled children, assistance dogs, second residence). If the document matches a special case, categorize accordingly (§33 for disability-related costs).\n"
-                "RECURRING PAYMENTS: Look for monthly recurring payments (same amount, same payee). These often indicate childcare (Kinderbetreuung), insurance, or subscriptions. Childcare = Sonderausgaben §10 (2/3, max 4.000€/Kind). Exclude Essensgeld/Verpflegung (not deductible).\n"
-                "CREDIT CARD vs BANK: If you see a lump-sum credit card payment on a bank statement (e.g. 'VISA-Abrechnung 1.847,22€'), mark it as status='nicht_absetzen' — the individual transactions are already on the credit card statement. Do NOT count both.\n"
-                "Use read_file to load reference files (e.g. kategorien_estg.md, pauschalen_2025.md) if needed.\n"
-                "Output ONLY the table rows, no commentary. I will save them automatically."
             )
+            # Chunk-Loop analysis prompt: configurable via batch_file_specs
+            _file_specs = agent.config.get("batch_file_specs", {})
+            _arbeitsdatei_spec = _file_specs.get("arbeitsdatei.md", "")
+            if _arbeitsdatei_spec and "| " not in _arbeitsdatei_spec:
+                # Text-mode (non-table): Agent-specific analysis prompt
+                # System prompt has the workflow. Reference files have the data.
+                # Chunk prompt just says: analyze this document, use your references.
+                chunk_prompt += (
+                    "Analysiere dieses Dokument und schreibe ein VOLLSTAENDIGES Ergebnis.\n\n"
+                    "PFLICHTFELDER (alle muessen beantwortet werden):\n"
+                    "- **Typ**: z.B. stueckliste, schaltplan, risikobeurteilung, betriebsanleitung, "
+                    "datenblatt, pruefbericht, ki_dokumentation, netzwerkdokumentation, layout, pneumatikplan\n"
+                    "- **Revision/Version**: z.B. Rev. 3, v2.1, oder 'nicht angegeben'\n"
+                    "- **Datum**: z.B. 2026-02-15, oder 'nicht angegeben'\n"
+                    "- **Aktuell**: Ja oder Nein (Nein wenn aelter als 2 Jahre oder veraltete Norm)\n"
+                    "- **Warnungen**: Auffaelligkeiten, fehlende Werte, Widersprueche\n"
+                    "- **Zusammenfassung**: 2-3 Saetze was das Dokument enthaelt\n\n"
+                    "Schreibe NUR das Analyseergebnis, keinen Kommentar."
+                )
+            else:
+                # Table-mode (legacy steuerberater): keep original prompt
+                chunk_prompt += (
+                    "Analyze this document chunk thoroughly.\n"
+                    "For EACH entry/item/line in the document, output ONE LINE in this exact format:\n"
+                    "| Datum | Beschreibung | Betrag | Kategorie | §EStG | Status |\n\n"
+                    "Example:\n"
+                    "| 16.02.2025 | PINKCAT Tastatur+Maus Set | 25,99€ | Werbungskosten/Arbeitsmittel | §9 | kategorisiert |\n\n"
+                    "Status values: kategorisiert / unklar / privat / nachfragen\n"
+                    "If unclear whether private or business: set status to 'nachfragen'.\n"
+                    "For Handwerker invoices: SEPARATE material costs from labor costs.\n"
+                    "Use read_file to load reference files if needed.\n"
+                    "Output ONLY the table rows, no commentary. I will save them automatically."
+                )
 
             try:
                 with _PhaseParams(agent, "phase2", log):
@@ -2015,38 +2741,89 @@ async def _phase2a_documents(
                 # NOTE: Cross-document dedup (credit card stmt vs bank Sammelabbuchung,
                 # HAZOP H-A.02) is handled via prompt instruction above. Deterministic
                 # cross-reference would require semantic amount matching across docs.
+                # Determine mode for this agent
+                _file_specs_chk = agent.config.get("batch_file_specs", {})
+                _arbeitsdatei_spec_chk = _file_specs_chk.get("arbeitsdatei.md", "")
+                _is_table_mode = "| " in _arbeitsdatei_spec_chk or not _arbeitsdatei_spec_chk
+
+                # Minimum quality check: result must be substantial
+                if result and len(result.strip()) < 100 and not _is_table_mode:
+                    log.warning(
+                        f"[{agent.agent_name}] Phase 2a: {doc_name} chunk {i+1} "
+                        f"result too short ({len(result.strip())} chars) — retry"
+                    )
+                    # Retry with more explicit prompt
+                    retry_prompt = chunk_prompt + (
+                        "\n\nDein vorheriges Ergebnis war zu kurz. "
+                        "Schreibe MINDESTENS 5 Zeilen mit allen Pflichtfeldern."
+                    )
+                    try:
+                        result = await _think_with_activity_check(
+                            agent, retry_prompt, log,
+                            stale_timeout=agent.config.get("batch_stale_timeout", 120),
+                            phase="2a",
+                        )
+                    except Exception:
+                        pass  # Use original short result
+
                 if result and len(result.strip()) > 10:
                     header_needed = not arbeitsdatei_path.exists() or arbeitsdatei_path.stat().st_size == 0
-                    # Load existing lines for dedup
-                    existing_lines = set()
-                    if arbeitsdatei_path.exists():
-                        for el in arbeitsdatei_path.read_text(encoding="utf-8").split("\n"):
-                            el = el.strip()
-                            if el.startswith("|") and "Datum" not in el and "---" not in el:
-                                # Normalize for comparison: strip whitespace between cells
-                                existing_lines.add("|".join(c.strip() for c in el.split("|")))
-                    new_lines = []
-                    for line in result.strip().split("\n"):
-                        line = line.strip()
-                        if line.startswith("|") and "Datum" not in line and "---" not in line:
-                            # Append source reference if not already present
-                            if doc_name not in line:
-                                line = line.rstrip("|").rstrip() + f" | {doc_name} |"
-                            else:
-                                line = line if line.endswith("|") else line + " |"
-                            # Dedup: check if this line already exists
-                            normalized = "|".join(c.strip() for c in line.split("|"))
-                            if normalized not in existing_lines:
-                                new_lines.append(line)
-                                existing_lines.add(normalized)
-                    if new_lines or header_needed:
-                        with open(arbeitsdatei_path, "a", encoding="utf-8") as f:
-                            if header_needed:
-                                f.write("# Beleganalyse — Steuerjahr 2025\n\n")
-                                f.write("| Datum | Beschreibung | Betrag | Kategorie | §EStG | Beleg-Ref | Status |\n")
-                                f.write("|-------|-------------|--------|-----------|-------|-----------|--------|\n")
-                            for nl in new_lines:
-                                f.write(nl + "\n")
+                    # Get arbeitsdatei spec from config (if defined)
+                    _file_specs = agent.config.get("batch_file_specs", {})
+                    _arbeitsdatei_spec = _file_specs.get("arbeitsdatei.md", "")
+                    _is_table_mode = "| " in _arbeitsdatei_spec or not _arbeitsdatei_spec
+                    # Table-mode (steuerberater): filter/dedup table rows
+                    # Text-mode (sichter etc.): append all text with doc separator
+                    if _is_table_mode and not _arbeitsdatei_spec:
+                        # Legacy default: Steuerberater table format
+                        existing_lines = set()
+                        if arbeitsdatei_path.exists():
+                            for el in arbeitsdatei_path.read_text(encoding="utf-8").split("\n"):
+                                el = el.strip()
+                                if el.startswith("|") and "Datum" not in el and "---" not in el:
+                                    existing_lines.add("|".join(c.strip() for c in el.split("|")))
+                        new_lines = []
+                        for line in result.strip().split("\n"):
+                            line = line.strip()
+                            if line.startswith("|") and "Datum" not in line and "---" not in line:
+                                if doc_name not in line:
+                                    line = line.rstrip("|").rstrip() + f" | {doc_name} |"
+                                else:
+                                    line = line if line.endswith("|") else line + " |"
+                                normalized = "|".join(c.strip() for c in line.split("|"))
+                                if normalized not in existing_lines:
+                                    new_lines.append(line)
+                                    existing_lines.add(normalized)
+                        if new_lines or header_needed:
+                            with open(arbeitsdatei_path, "a", encoding="utf-8") as f:
+                                if header_needed:
+                                    f.write("# Beleganalyse — Steuerjahr 2025\n\n")
+                                    f.write("| Datum | Beschreibung | Betrag | Kategorie | §EStG | Beleg-Ref | Status |\n")
+                                    f.write("|-------|-------------|--------|-----------|-------|-----------|--------|\n")
+                                for nl in new_lines:
+                                    f.write(nl + "\n")
+                    else:
+                        # Text-mode: Append full chunk result with document separator
+                        # Dedup: Skip if this document was already analyzed
+                        _already_in = False
+                        if arbeitsdatei_path.exists():
+                            _existing = arbeitsdatei_path.read_text(encoding="utf-8")
+                            if _doc_has_real_analysis(_existing, doc_name):
+                                _already_in = True
+                            elif f"## {doc_name}" in _existing:
+                                # A fallback stub exists — drop it so the real
+                                # analysis replaces it (don't silently discard).
+                                if _remove_fallback_section(arbeitsdatei_path, doc_name):
+                                    log.info(
+                                        f"[{agent.agent_name}] Phase 2a: replaced "
+                                        f"fallback stub for {doc_name}"
+                                    )
+                        if not _already_in:
+                            with open(arbeitsdatei_path, "a", encoding="utf-8") as f:
+                                if header_needed:
+                                    f.write(f"# Arbeitsdatei — {agent.agent_name}\n\n")
+                                f.write(f"\n## {doc_name}\n\n")
+                                f.write(_sanitize_chunk_result(result).strip() + "\n")
                     log.info(
                         f"[{agent.agent_name}] Phase 2a: {doc_name} chunk {i+1}/{len(chunks)} "
                         f"→ appended to arbeitsdatei.md ({len(result)} chars)"
@@ -2056,6 +2833,12 @@ async def _phase2a_documents(
                         f"[{agent.agent_name}] Phase 2a: {doc_name} chunk {i+1}/{len(chunks)} "
                         f"produced empty/short result ({len(result)} chars)"
                     )
+                    # Write fallback entry so Output Assembly can still inventory this document
+                    if not arbeitsdatei_path.exists() or f"## {doc_name}" not in arbeitsdatei_path.read_text(encoding="utf-8"):
+                        with open(arbeitsdatei_path, "a", encoding="utf-8") as f:
+                            f.write(f"\n## {doc_name}\n\n")
+                            f.write("Dokument konnte nicht automatisch analysiert werden. "
+                                    "Manuelle Pruefung empfohlen.\n")
 
                 doc_results.append({
                     "thread_id": f"doc:{doc_name}:chunk{i+1}",
@@ -2090,9 +2873,12 @@ async def _phase2a_documents(
 
 
 async def _phase5_persist(
-    agent: "AIMOSAgent", lagebild: str, phase3_results: list[dict],
-    ws_base: Path, log: logging.Logger, msg_count: int = 0,
+    agent: "AIMOSAgent", lagebild: str = "", phase3_results: list[dict] | None = None,
+    ws_base: Path | None = None, log: logging.Logger | None = None, msg_count: int = 0,
 ):
+    if phase3_results is None:
+        phase3_results = []
+    assert ws_base is not None and log is not None, "ws_base and log are required"
     """Phase 5: PERSIST — Update workspace files, set reminders, remember key facts."""
     # H-14: Backup state.md before overwrite
     leading_file_path = ws_base / agent.config.get("batch_leading_file", "state.md")
@@ -2126,21 +2912,37 @@ async def _phase5_persist(
     # S-7: Build Phase 3 results summary
     p3_summary_lines = []
     for pr in phase3_results:
-        if pr["status"] in ("sent", "analyzed", "proactive", "no_contact"):
-            label = pr["status"]
-            p3_summary_lines.append(f"  ✓ {pr['thread_id']}: {label} ({pr.get('response_len', 0)} chars)")
+        if pr.get("action") == "output_assembly":
+            # File-mode output assembly result
+            p3_summary_lines.append(
+                f"  ✓ Output Assembly: {pr.get('entries', 0)} Dokumente, "
+                f"{pr.get('missing', 0)} fehlende Anhang-IV Punkte"
+            )
+        elif "status" in pr:
+            if pr["status"] in ("sent", "analyzed", "proactive", "no_contact"):
+                label = pr["status"]
+                p3_summary_lines.append(f"  ✓ {pr['thread_id']}: {label} ({pr.get('response_len', 0)} chars)")
+            else:
+                p3_summary_lines.append(f"  ✗ {pr['thread_id']}: FAILED — {pr.get('error', 'unknown')}")
         else:
-            p3_summary_lines.append(f"  ✗ {pr['thread_id']}: FAILED — {pr.get('error', 'unknown')}")
+            p3_summary_lines.append(f"  ? {pr}")
     phase3_summary = "\n".join(p3_summary_lines) if p3_summary_lines else "  (no threads processed)"
 
     leading_file_spec = agent.config.get("batch_leading_file", "state.md")
+    _lagebild_block = f"LAGEBILD FROM THIS SESSION:\n{lagebild}\n\n" if lagebild and len(lagebild) > 100 else ""
     phase5_prompt = (
-        f"LAGEBILD FROM THIS SESSION:\n{lagebild}\n\n"
+        f"{_lagebild_block}"
         f"PHASE 4 RESULTS (what you actually did):\n{phase3_summary}\n\n"
         "This batch session is complete. You MUST now call write_file for EACH of these files.\n"
         "Do NOT just describe what you would write — actually CALL the write_file tool.\n\n"
         f"{file_spec_block}"
-        f"STEP 1: Call write_file(filename=\"arbeitsdatei.md\", content=\"...\") — append new analysis results.\n"
+        # File-mode: arbeitsdatei wurde vom Chunk-Loop befüllt → NICHT überschreiben
+        + ("STEP 1: arbeitsdatei.md wurde bereits vom Analyseprozess befuellt. NICHT ueberschreiben.\n"
+           if agent.config.get("batch_phase4_mode") == "file" and
+              (ws_base / "arbeitsdatei.md").exists() and
+              (ws_base / "arbeitsdatei.md").stat().st_size > 200
+           else "STEP 1: Call write_file(filename=\"arbeitsdatei.md\", content=\"...\") — append new analysis results.\n")
+        +
         f"STEP 2: Call write_file(filename=\"offene_punkte.md\", content=\"...\") — open questions for stakeholders.\n"
         f"STEP 3: Call write_file(filename=\"todo.md\", content=\"...\") with your task list.\n"
         f"STEP 4: Call write_file(filename=\"status.md\", content=\"...\") with status table.\n"
